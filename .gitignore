@@ -1,0 +1,10 @@
+# fetched / built by setup.sh
+/.venv/
+/ext/
+/firmware/appotech-sdk/
+/firmware/compilers/
+__pycache__/
+.DS_Store
+
+# private: your camera's flash backup (stored photos + vendor firmware)
+/dumps/

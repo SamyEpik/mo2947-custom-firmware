@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Run a camera tool with the project's Python (.venv from setup.sh).
+#
+#   ./cam dump  ...   tools/mo2947_dump.py   read-only flash backup     (./cam dump --help)
+#   ./cam flash ...   tools/mo2947_flash.py  install / restore firmware (./cam flash --help)
+#   ./cam apxd  ...   tools/mo2947_apxd.py   USB debug link to our firmware
+#
+# macOS: dump and flash run under sudo, because libusb has to detach the camera's mass-storage driver. Files they write
+# in dumps/ are given back to you afterwards.
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PY="$ROOT/.venv/bin/python"
+[[ -x "$PY" ]] || PY=python3
+
+tool=${1:-}
+case "$tool" in
+	dump|flash|apxd) shift ;;
+	*) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac
+script="$ROOT/tools/mo2947_$tool.py"
+mkdir -p "$ROOT/dumps"
+
+if [[ "$(uname)" == Darwin && "$tool" != apxd && $EUID -ne 0 ]]; then
+	status=0
+	sudo --preserve-env=KDC_LIBUSB,KDC_REPO,MO2947_DUMP "$PY" -I "$script" "$@" || status=$?
+	sudo chown -R "$(id -u):$(id -g)" "$ROOT/dumps" 2>/dev/null || true
+	exit $status
+fi
+exec "$PY" -I "$script" "$@"

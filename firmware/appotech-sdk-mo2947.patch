@@ -1,0 +1,1660 @@
+From 3ca1fba31d059f7c1b78a7e7ba07eb5eeb749157 Mon Sep 17 00:00:00 2001
+From: Samuel Steinhart <ssteinhart@student.tgm.ac.at>
+Date: Thu, 12 Nov 2026 22:48:44 +0100
+Subject: [PATCH 1/4] Add MO2947 (AX3295B, 2 MiB) board, flash-booted through
+ the stock bootstrap
+
+Board mo2947: the MOB/MO2947 promotional toy camera (Jinrixin/Buildwin AX3295B,
+NV3030B 240x320 LCD, SP0A39 sensor, 4 MiB 5E4016 flash, 2 MiB SDRAM). Same pins
+as the Action camera.
+
+Boot: the image is linked at 0x02000000 and replaces the stock app in flash
+(0x2200..); the unchanged stock header and bootstrap load it and call
+0x020004A8. Sector 0 and the bootstrap are never modified. entry.S/early.c run
+a minimal power hold and a SHUTTER-at-power-on escape to the boot ROM loader
+before any SDK code, then jump to apx_spi_entry.
+
+SDK changes (other boards unchanged):
+- soc.h: memory map can come from a board's board_memory.h
+- debug.c, display*.c, spi_overlay.c, runtime.c: use the memory-map macros
+  instead of fixed 4 MiB addresses
+- power.c: APX_PM40_HOLD (MO2947 stock holds PMU reg 0x40 = 0x0E)
+- clock.c: APX_CLOCK_INHERIT; the AX3295B boot ROM leaves PLL1 at
+  0x8858=0x1023/0x885C=0x112A8800 (144 MHz), not a JT5295 pair: keep it
+- display_st7789.c: GPIO panel reset and backlight when the board has them
+- camera.c: APX_SENSOR_LDO and APX_SENSOR_RESET_PD1 (stock MO2947 values)
+- ffconf.h/storage.c: optional fixed FatFs code page (APX_FATFS_CODE_PAGE);
+  the dynamic CJK tables (478 KB) do not fit the boot ROM's load window
+- Makefile: BOARD=mo2947 builds a flat .bin; panel.inc is generated from the
+  owner's flash dump and not committed
+
+Examples: mo2947-demo (display/keys/LED/USB), mo2947-camera (camera preview,
+SD, speaker, microphone, battery, USB debug link; all verified on the device).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .gitignore                    |   4 ++
+ Makefile                      |  29 ++++++--
+ boards/mo2947/board.h         |  92 ++++++++++++++++++++++++
+ boards/mo2947/board_memory.h  |  24 +++++++
+ boards/mo2947/early.c         |  35 ++++++++++
+ boards/mo2947/entry.S         |  27 ++++++++
+ boards/mo2947/gen_panel.py    |  25 +++++++
+ examples/mo2947-camera/main.c | 127 ++++++++++++++++++++++++++++++++++
+ examples/mo2947-demo/main.c   |  60 ++++++++++++++++
+ include/appotech/soc.h        |  16 +++++
+ linker/mo2947.ld              |  34 +++++++++
+ src/camera.c                  |  10 ++-
+ src/clock.c                   |  12 +++-
+ src/debug.c                   |  16 ++---
+ src/display.c                 |   2 +-
+ src/display_st7789.c          |  19 ++++-
+ src/power.c                   |   5 +-
+ src/runtime.c                 |   4 +-
+ src/spi_overlay.c             |   4 +-
+ src/storage.c                 |   4 ++
+ third_party/fatfs/ffconf.h    |   4 ++
+ 21 files changed, 531 insertions(+), 22 deletions(-)
+ create mode 100644 boards/mo2947/board.h
+ create mode 100644 boards/mo2947/board_memory.h
+ create mode 100644 boards/mo2947/early.c
+ create mode 100644 boards/mo2947/entry.S
+ create mode 100644 boards/mo2947/gen_panel.py
+ create mode 100644 examples/mo2947-camera/main.c
+ create mode 100644 examples/mo2947-demo/main.c
+ create mode 100644 linker/mo2947.ld
+
+diff --git a/.gitignore b/.gitignore
+index d174e92..aa728bc 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -6,3 +6,7 @@ __pycache__/
+ .pytest_cache/
+ 
+ /research/silvergear/*.disasm
++
++# MO2947 port: generated from the owner's flash dump (vendor data), rebuilt by the Makefile
++/boards/mo2947/panel.inc
++/toolchain-build-*.log
+diff --git a/Makefile b/Makefile
+index 0b00c8c..b4a92ab 100644
+--- a/Makefile
++++ b/Makefile
+@@ -5,7 +5,8 @@ AR := $(CROSS)ar
+ OBJDUMP := $(CROSS)objdump
+ SIZE := $(CROSS)size
+ BOARD ?= action-vision
+-BOARDS := action-vision silvergear-3222882
++MO2947_DUMP ?= $(HOME)/Projects/ToyCamera/dumps/mo2947_flash_a.bin
++BOARDS := action-vision silvergear-3222882 mo2947
+ ifeq ($(filter $(BOARD),$(BOARDS)),)
+ $(error BOARD must be one of: $(BOARDS))
+ endif
+@@ -48,7 +49,7 @@ override APX_USB_MSC := 1
+ endif
+ BUILD ?= $(if $(filter action-vision,$(BOARD)),build,build/$(BOARD))$(if $(filter-out $(DEFAULT_USB_STACK),$(USB_STACK)),-$(USB_STACK))
+ BOARD_INPUTS := $(sort $(wildcard boards/$(BOARD)/*))
+-DISPLAY_SOURCE := $(if $(filter silvergear-3222882,$(BOARD)),src/display_st7789.c,src/display.c)
++DISPLAY_SOURCE := $(if $(filter silvergear-3222882 mo2947,$(BOARD)),src/display_st7789.c,src/display.c)
+ OPT ?= -Os
+ LTO ?= 1
+ HEAP_SIZE ?= 16384
+@@ -93,7 +94,9 @@ endif
+ LVGL_ENABLED := $(filter lvgl-demo,$(EXAMPLE))
+ # The LVGL image has nothing but the small peripheral drivers in the extra-RAM bank, and a segment up there costs the SPI image
+ # the whole zero gap below it (~620 KB of flash). Its linker script keeps those drivers next to the main code instead.
+-LINKER_SCRIPT := $(if $(LVGL_ENABLED),$(BUILD)/ram-compact.ld,linker/ram.ld)
++LINKER_SCRIPT := $(if $(filter mo2947,$(BOARD)),linker/mo2947.ld,$(if $(LVGL_ENABLED),$(BUILD)/ram-compact.ld,linker/ram.ld))
++# MO2947: flash-booted at 0x02000000 through the stock bootstrap (its call target 0x020004a8 jumps to apx_spi_entry).
++BOARD_OBJECTS := $(if $(filter mo2947,$(BOARD)),$(BUILD)/mo2947_entry.o $(BUILD)/mo2947_early.o)
+ LVGL_DEMO ?= benchmark
+ # LVGL performance monitor (FPS/CPU/refresh in the benchmark's scene label): on for the benchmark, off for widgets.
+ LVGL_PERF ?= $(if $(filter benchmark,$(LVGL_DEMO)),1,0)
+@@ -119,6 +122,9 @@ endif
+ # Extra preprocessor options for one example, e.g. make EXAMPLE=usb-modes EXAMPLE_DEFS=-DAPX_MODES_SD=1
+ EXAMPLE_DEFS ?=
+ CFLAGS += $(EXAMPLE_DEFS)
++ifeq ($(BOARD),mo2947)
++CFLAGS += -DAPX_FATFS_CODE_PAGE=437
++endif
+ ifeq ($(USB_STACK),tinyusb)
+ # src/tusb holds tusb_config.h; TinyUSB's own headers are -isystem so only our code is held to -Werror
+ CFLAGS += -Isrc/tusb -isystem third_party/tinyusb/src -DAPX_USB_TINYUSB=1 -DAPX_USB_MSC=$(APX_USB_MSC) -DAPX_USB_UVC=$(APX_USB_UVC) -DAPX_USB_UAC=$(APX_USB_UAC)
+@@ -180,7 +186,22 @@ else
+ LVGL_LIB :=
+ endif
+ .PHONY: all clean FORCE
++ifeq ($(BOARD),mo2947)
++all: $(BUILD)/$(EXAMPLE).bin $(BUILD)/libfatfs.a
++else
+ all: $(BUILD)/$(EXAMPLE).manifest.json $(BUILD)/libfatfs.a
++endif
++$(BUILD)/mo2947_entry.o: boards/mo2947/entry.S | $(BUILD)
++	$(CC) $(CFLAGS) -c $< -o $@
++$(BUILD)/mo2947_early.o: boards/mo2947/early.c | $(BUILD)
++	$(CC) $(filter-out -flto -fuse-linker-plugin,$(CFLAGS)) -c $< -o $@
++boards/mo2947/panel.inc: boards/mo2947/gen_panel.py $(MO2947_DUMP)
++	python3 -I $< $(MO2947_DUMP) $@
++# Flash image: 0x02000000.. as the boot ROM loads it from flash 0x2200. The PLL check needs pyelftools.
++$(BUILD)/$(EXAMPLE).bin: $(BUILD)/$(EXAMPLE).elf
++	$(CROSS)objcopy -O binary --gap-fill 0 $< $@
++	@if python3 -c 'import elftools' 2>/dev/null; then python3 tools/check_clock_elf.py $< --output $(BUILD)/$(EXAMPLE).clock-check.json; else echo 'WARNING: pyelftools missing, PLL code check skipped'; fi
++	@ls -l $@
+ $(BUILD):
+ 	mkdir -p $@
+ FORCE:
+@@ -244,7 +265,7 @@ $(BUILD)/main.o: $(MAIN) $(BUILD)/config.stamp | $(BUILD)
+ $(BUILD)/libappotech.a: $(OBJECTS)
+ 	rm -f $@ # ar rcs updates in place: a stale usb.o from an earlier USB_STACK would stay in the archive and could win the link
+ 	$(AR) rcs $@ $^
+-$(BUILD)/$(EXAMPLE).elf: $(BUILD)/startup.o $(BUILD)/main.o $(BUILD)/libappotech.a $(BUILD)/libfatfs.a $(LVGL_LIB) $(LINKER_SCRIPT) $(LIBC) $(LIBGCC)
++$(BUILD)/$(EXAMPLE).elf: $(BUILD)/startup.o $(BOARD_OBJECTS) $(BUILD)/main.o $(BUILD)/libappotech.a $(BUILD)/libfatfs.a $(LVGL_LIB) $(LINKER_SCRIPT) $(LIBC) $(LIBGCC)
+ 	$(CC) $(CFLAGS) $(LTO_LDFLAGS) -nostartfiles -T$(LINKER_SCRIPT) -Wl,-e,_start,--gc-sections,--build-id=none,--defsym=APX_HEAP_SIZE=$(HEAP_SIZE),-Map,$(BUILD)/$(EXAMPLE).map -o $@ $(filter %.o,$^) -Wl,--start-group $(BUILD)/libappotech.a $(BUILD)/libfatfs.a $(LVGL_LIB) -Wl,--end-group
+ 	$(OBJDUMP) -d $@ > $(BUILD)/$(EXAMPLE).disasm
+ 	$(SIZE) $@
+diff --git a/boards/mo2947/board.h b/boards/mo2947/board.h
+new file mode 100644
+index 0000000..8269e4f
+--- /dev/null
++++ b/boards/mo2947/board.h
+@@ -0,0 +1,92 @@
++#ifndef APPOTECH_BOARD_H
++#define APPOTECH_BOARD_H
++#define APX_BOARD_SILVERGEAR 0
++#define APX_BOARD_ID "mo2947"
++#define APX_CAMERA_COUNT 1u
++#define APX_HAS_PRINTER 0
++#define APX_DISPLAY_NATIVE_WIDTH 240u
++#define APX_DISPLAY_NATIVE_HEIGHT 320u
++#define APX_DISPLAY_WIDTH 320u
++#define APX_DISPLAY_HEIGHT 240u
++#define APX_BUTTON_INPUT_MASK 3u
++#define APX_BUTTON_TOLERANCE 29u
++#define APX_BUTTON_CENTERS {0,306,484,658,817}
++#define APX_BUTTON_FLAGS {APX_BUTTON_SHUTTER,APX_BUTTON_DOWN,APX_BUTTON_UP,APX_BUTTON_LEFT,APX_BUTTON_RIGHT}
++#define APX_BOARD_NAME "mo2947-ax3295b"
++/* SPI NOR: 5e4016 (C25VQ32ET), 4 MiB. Erase granule 4 KiB verified on the device 2026-11-12. */
++#define APX_SPI_JEDEC 0x5e4016u
++#define APX_SPI_FLASH_BYTES 0x400000u
++/* MO2947 bootstrap: same routine as Action, saved ROM stack page at SRAM 0x1a38 (SPI 0x540: movhi r4,0 / ori r4,r4,0x1a38). */
++#define APX_SPI_BOOT_SAVED_STACK 0x1a38u
++/* Flight-recorder sectors (APX_SPI_TRACE / APX_LAUNCH_TRACE_MODE builds): the last two sectors of the chip. */
++#define APX_SPI_TRACE_SECTOR 0x003ff000u
++#define APX_SPI_TRACE_LAUNCH_SECTOR 0x003fe000u
++#define APX_BATTERY_CALIBRATION_ADDRESS 0x1e28u /* MO2947 bootstrap: adc_to_mv calibration word */
++#define APX_BATTERY_OFFSET_MV 20u
++#define APX_SD_CLOCK_SOURCE_HZ 144000000u
++#define APX_SD_CLOCK_HZ 24000000u
++/* Widest SD bus to try. Four bits use PA3 and PE10/PE11 (stock's unreachable 4-bit route); nothing else in the SDK drives them on this board, and the driver
++ * verifies the wiring before it keeps the wide bus (research/sd.md). */
++#ifndef APX_SD_BUS_WIDTH_MAX
++#define APX_SD_BUS_WIDTH_MAX 4
++#endif
++#ifndef APX_CPU_MHZ
++#define APX_CPU_MHZ 144
++#endif
++#if APX_CPU_MHZ != 96 && APX_CPU_MHZ != 144
++#error Unsupported APX_CPU_MHZ
++#endif
++#define APX_CPU_HZ_ESTIMATE (APX_CPU_MHZ*1000000u)
++#define APX_REFERENCE_HZ_ESTIMATE 32768u
++/* Stock 02033a68/02024774: UART baud divider is write-only (reads zero).
++ * Restore the known inherited 144MHz/115200-1 setting at teardown. */
++#define APX_UART_BOOT_DIVIDER 1249u
++/* Shared divider b is unchanged; compensate the codec rates for each PLL. */
++#if APX_CPU_MHZ == 144
++#define APX_AUDIO_SELECTOR_8000 10u
++#define APX_AUDIO_SELECTOR_16000 6u
++#define APX_AUDIO_SELECTOR_32000 2u
++/* At 144 MHz the low rate field cannot encode 48 directly. The stock
++ * recording path's bit 22 with field 31 gives the measured 8 kHz rate. */
++#define APX_MIC_CONTROL_8000 0x005f4000u
++#define APX_MIC_CONTROL_16000 0x00174000u
++#define APX_MIC_CONTROL_32000 0x000b4000u
++#else
++#define APX_AUDIO_SELECTOR_8000 8u
++#define APX_AUDIO_SELECTOR_16000 4u
++#define APX_AUDIO_SELECTOR_32000 0u
++/* Recording prescalers verified with the same shared audio clock divider b. */
++#define APX_MIC_CONTROL_8000 0x001f4000u
++#define APX_MIC_CONTROL_16000 0x000f4000u
++#define APX_MIC_CONTROL_32000 0x00074000u
++#endif
++#define APX_BUTTON_GROUP 1u
++#define APX_POWER_BUTTON_MASK 0x0001u
++/* Stock ad-key open also configures PB1; its analog pad assignment is unverified. */
++#define APX_BUTTON_AUX_INPUT_MASK 0x0002u
++#define APX_BUTTON_ADC_CHANNEL 3u
++#define APX_BUTTON_ADC_DIVIDER 71u /* 144 MHz / (2*(71+1)) = 1 MHz */
++#define APX_STATUS_LED_GROUP 1u
++#define APX_STATUS_LED_MASK 0x0020u
++/* MO2947 stock: push-pull output + latch (verified with mo2947-hello). */
++#define APX_STATUS_LED_LATCH 1
++/* MO2947 Y200-DV04-VO1, NV3030B 240x320 on the 8080 bus. Same pins as Action. GPIO masks, not pin numbers. */
++#define APX_LCD_RESET_GROUP 1u
++#define APX_LCD_RESET_MASK 0x0040u
++#define APX_LCD_BACKLIGHT_GROUP 0u
++#define APX_LCD_BACKLIGHT_MASK 0x0040u
++#define APX_LCD_RS_GROUP 4u
++#define APX_LCD_RS_MASK 0x0004u
++#define APX_LCD_CLOCK_DIVIDER 15u /* stock config block: 0x887C = (15-1)<<2 */
++#define APX_LCD_DEFAULT_ROTATION 3u /* landscape; native (0,0) is the top-right corner (seen on the device) */
++#define APX_LCD_PIO_TIMEOUT_TICKS 164u /* approximately 5 ms */
++/* MO2947 stock pm_power_hold writes PMU reg 0x40 = 0x0E (Action uses 6). */
++#define APX_PM40_HOLD 0x0Eu
++/* AX3295B boot ROM: PLL1 pair differs from the JT5295 ones; keep the bootstrap's clock (src/clock.c). */
++#define APX_CLOCK_INHERIT 1
++/* Camera: SP0A39 (chip ID 0x0A39 read on the device). Stock sensor entry #6 at flash 0x7CE8C: I2C 0x42/0x43,
++ * MCLK 24 MHz, LDO0 code 0x10, LDO1 code 3 -> SPR 0x8868[12:0] = 0x10|0x20|3<<7|0x1000. PD0 power-down low,
++ * PD1 reset (active low) high (stock 0x02002CA8). */
++#define APX_SENSOR_LDO 0x11b0u
++#define APX_SENSOR_RESET_PD1 1
++#endif
+diff --git a/boards/mo2947/board_memory.h b/boards/mo2947/board_memory.h
+new file mode 100644
+index 0000000..b8feef2
+--- /dev/null
++++ b/boards/mo2947/board_memory.h
+@@ -0,0 +1,24 @@
++/* MO2947: 2 MiB SDR SDRAM at 0x02000000 (the stock bootstrap's stack top is 0x021FFFFC). The image is flashed at
++ * 0x2200 and loaded by the boot ROM to 0x02000000 (header: 0x7A400 bytes); the bootstrap calls 0x020004A8.
++ * linker/mo2947.ld packs bss, heap and the NOLOAD buffers right after the image (the rest of the ROM's load window is
++ * free once our code runs), stack at the top. The bounds below follow the linker symbols. */
++#ifndef __ASSEMBLER__
++#include <stdint.h>
++extern unsigned char __heap_end[],__display_dma_start[],__display_dma_end[],__large_buffer_start[],__large_buffer_end[],
++                     __jpeg_buffer_start[],__jpeg_buffer_end[];
++#endif
++#define APX_RAM_BASE 0x02000000u
++#define APX_RAM_END 0x02200000u
++#define APX_IMAGE_END 0x0207a400u
++#define APX_RUNTIME_BASE 0x02000000u
++#define APX_RUNTIME_END ((uintptr_t)__heap_end)
++#define APX_LCD_DMA_BASE ((uintptr_t)__display_dma_start)
++#define APX_LCD_DMA_END ((uintptr_t)__display_dma_end)
++#define APX_LOW_RAM_BASE ((uintptr_t)__large_buffer_start)
++#define APX_LOW_RAM_END ((uintptr_t)__large_buffer_end)
++#define APX_CODEC_RAM_BASE ((uintptr_t)__jpeg_buffer_start)
++#define APX_CODEC_RAM_END ((uintptr_t)__jpeg_buffer_end)
++#define APX_EXTRA_RAM_BASE 0x02000000u /* no separate extra bank (empty range): that code is part of the image */
++#define APX_EXTRA_RAM_END 0x02000000u
++#define APX_STACK_BASE 0x021fc000u
++#define APX_STACK_END 0x02200000u
+diff --git a/boards/mo2947/early.c b/boards/mo2947/early.c
+new file mode 100644
+index 0000000..a2a1c8d
+--- /dev/null
++++ b/boards/mo2947/early.c
+@@ -0,0 +1,35 @@
++/* MO2947 early escape, run before any SDK code (no .bss/.data, caches off, bootstrap stack).
++ * Copied from firmware/mo2947-hello (verified on the device 2026-11-12): power hold as stock pm_power_hold +
++ * pm_domain_init, then SHUTTER (ADC channel 3 below 30, twice 30 ms apart) -> return 2 for the USB loader. */
++#include <stdint.h>
++static inline void w(uint32_t n,uint32_t v){__asm__ volatile("l.mtspr %0,%1,0"::"r"(n),"r"(v):"memory");}
++static inline uint32_t r(uint32_t n){uint32_t v;__asm__ volatile("l.mfspr %0,%1,0":"=r"(v):"r"(n):"memory");return v;}
++static void pm_wait(void){uint32_t t=0x8000;while((r(0x88e0)&8)&&--t){}}
++static void pm_tx(uint32_t b){w(0x88ec,b&255);pm_wait();}
++static void pm_wr(uint32_t c,uint32_t v){w(0x88e0,r(0x88e0)|0x100);pm_tx(c);pm_tx(v);w(0x88e0,r(0x88e0)&~0x100u);}
++static uint32_t pm_rd(uint32_t c){w(0x88e0,r(0x88e0)|0x100);pm_tx(c);w(0x88ec,0);pm_wait();uint32_t v=r(0x88ec)&255;w(0x88e0,r(0x88e0)&~0x100u);return v;}
++static void delay_ms(uint32_t ms){
++    uint32_t need=ms<<5,acc=0,guard=0,last=r(0x9804),cap=(need<<10)+100000;
++    while(acc<need&&++guard<cap){uint32_t now=r(0x9804);acc+=(now-last)&0x3fff;last=now;}
++}
++static int shutter(void){
++    w(0x8840,r(0x8840)&~(1u<<29));w(0x9170,0x13);w(0x9174,71);w(0x9170,r(0x9170)|0x80);
++    uint32_t t=0x8ffff;while((r(0x9170)&0x40)&&--t){}
++    return (r(0x9178)&0x3ff)<30;
++}
++__attribute__((used,noinline,section(".text.mo2947_early"))) int mo2947_early(void){
++    /* Record the clock state the bootstrap leaves, for reading through the loader: SRAM 0x2e80 =
++     * 'CLK0', 0x8858, 0x885c, 0x9800, 0x9808, 0x880c, 0x8840, 0x8844, 0x8864. */
++    volatile uint32_t *rec=(volatile uint32_t *)0x2e80u;
++    static const uint16_t sprs[8]={0x8858,0x885c,0x9800,0x9808,0x880c,0x8840,0x8844,0x8864};
++    for(unsigned i=0;i<8;++i)rec[1+i]=r(sprs[i]);
++    rec[0]=0x304b4c43u;
++    w(0x88e0,r(0x88e0)|0x40);pm_wr(0x41,0x0e);
++    pm_wr(0x43,0xe0);pm_wr(0x45,0);pm_wr(0x59,pm_rd(0x58)|8);pm_wr(0x41,pm_rd(0x40)|0x10);pm_wr(0x5b,8);
++    if(!shutter())return 0;
++    delay_ms(30);
++    if(!shutter())return 0;
++    w(0x880c,0x5500);                 /* as stock 0xDA: watchdog off, SPR 0x18 bits 1,2,14 cleared */
++    w(0x18,r(0x18)&~0x4006u);
++    return 2;
++}
+diff --git a/boards/mo2947/entry.S b/boards/mo2947/entry.S
+new file mode 100644
+index 0000000..f0e58c4
+--- /dev/null
++++ b/boards/mo2947/entry.S
+@@ -0,0 +1,27 @@
++/* The unchanged stock bootstrap calls 0x020004A8 (flash 0x528/0x52C) after its SDRAM init, with r1 = 0x021FFFFC.
++ * 1. mo2947_early(): power hold and SHUTTER check with raw SPR code only (the path proven by mo2947-hello).
++ *    If it returns 2, return 2 to the bootstrap -> boot ROM USB loader, before any SDK code has run.
++ * 2. Otherwise restore r1/r2/r9 exactly and jump to the SDK's cold-boot entry (it saves them in apx_boot_context). */
++    .nodelay
++    .section .text.mo2947_bootstrap_call,"ax",@progbits
++    .global mo2947_bootstrap_call
++mo2947_bootstrap_call:
++    l.j     mo2947_entry_body
++    l.nop
++    .section .text.mo2947_entry_body,"ax",@progbits
++mo2947_entry_body:
++    l.addi  r1,r1,-16
++    l.sw    0(r1),r9
++    l.sw    4(r1),r2
++    l.jal   mo2947_early
++    l.nop
++    l.lwz   r9,0(r1)
++    l.lwz   r2,4(r1)
++    l.addi  r1,r1,16
++    l.sfeqi r11,2
++    l.bf    1f
++    l.nop
++    l.j     apx_spi_entry
++    l.nop
++1:  l.jr    r9              /* r11 = 2: back to the bootstrap, which enters the USB loader */
++    l.nop
+diff --git a/boards/mo2947/gen_panel.py b/boards/mo2947/gen_panel.py
+new file mode 100644
+index 0000000..b4269ca
+--- /dev/null
++++ b/boards/mo2947/gen_panel.py
+@@ -0,0 +1,25 @@
++#!/usr/bin/env python3
++"""Write panel.inc (display_st7789.c format: {operation, value} pairs) from the owner's flash dump.
++Stock NV3030B table at flash 0x7C884 (0x418 bytes, u32 LE pairs, op 0 cmd / 1 data / 3 delay ms, 0xFFFFFFFF end).
++INVON (0x21) is left out: with this driver's RGB565 data the stock INVON shows inverted colours (seen on the device).
++The trailing RAMWR is left out: the driver opens its own window. Output is vendor data: keep it private.
++Run: python3 -I gen_panel.py DUMP panel.inc"""
++import struct, sys
++TABLE, LENGTH = 0x7C884, 0x418
++flash = open(sys.argv[1], 'rb').read()
++words = struct.unpack_from(f'<{LENGTH // 4}I', flash, TABLE)
++steps = []
++for op, val in zip(words[0::2], words[1::2]):
++    if op == 0xFFFFFFFF:
++        break
++    assert op in (0, 1, 3), op
++    steps.append((op, val))
++else:
++    sys.exit('no end marker')
++assert steps[-1] == (0, 0x2C) and (0, 0x21) in steps and (0, 0x29) in steps
++steps = [s for s in steps[:-1] if s != (0, 0x21)]
++with open(sys.argv[2], 'w') as f:
++    f.write('/* Generated by boards/mo2947/gen_panel.py from the owner\'s dump (flash 0x7C884). Vendor data: do not publish. */\n')
++    for op, val in steps:
++        f.write(f'    {{{op}u,0x{val:x}u}},\n')
++print(f'{len(steps)} steps')
+diff --git a/examples/mo2947-camera/main.c b/examples/mo2947-camera/main.c
+new file mode 100644
+index 0000000..87efd7a
+--- /dev/null
++++ b/examples/mo2947-camera/main.c
+@@ -0,0 +1,127 @@
++/* MO2947 combined test image: everything in one flash install.
++ * Base: the SDK's Action camera app (live preview; every subsystem reachable over the USB debug link with
++ * tools/mo2947_apxd.py: STORAGE, CAMERA, JPEG, AUDIO, MICROPHONE, BATTERY, SPI).
++ * Keys on the camera (each action is logged; read with "mo2947_apxd.py log"):
++ *   SHUTTER         photo 640x480 -> SD 0:/MO_nnnn.JPG (new files only)
++ *   UP              speaker tone 880 Hz
++ *   DOWN            record 2 s (16 kHz), play it back, save 0:/MO_nnnn.WAV
++ *   RIGHT           battery voltage to the log
++ *   hold LEFT 2 s   boot ROM USB loader (reflash)
++ *   hold POWER 2 s  power off (after releasing it once)
++ * Beeps: short high = done, long low = failed. Hold SHUTTER at power-on: loader (early escape, before the SDK). */
++#include <appotech/soc.h>
++#include "board.h"
++#include <appotech/usb.h>
++#include <appotech/debug.h>
++#include <appotech/display.h>
++#include <appotech/buttons.h>
++#include <appotech/power.h>
++#include <appotech/audio_files.h>
++#include <appotech/microphone_files.h>
++#include <appotech/microphone.h>
++#include <appotech/camera_files.h>
++#include <appotech/uart.h>
++#include <appotech/battery.h>
++#include <appotech/spi.h>
++#include <appotech/trace.h>
++#include <appotech/storage.h>
++#include <stdio.h>
++#include <string.h>
++
++typedef uint32_t (*command_fn)(unsigned,const uint8_t *,size_t,uint8_t *,size_t *);
++static uint8_t reply[APXD_MAX_PAYLOAD+1];
++static uint32_t command(command_fn f,unsigned c,const void *in,size_t len) {
++    size_t n=0;uint32_t r=f(c,(const uint8_t *)in,len,reply,&n);
++    reply[n<APXD_MAX_PAYLOAD?n:APXD_MAX_PAYLOAD]=0;return r;
++}
++static void put32(uint8_t *p,uint32_t v){p[0]=v;p[1]=v>>8;p[2]=v>>16;p[3]=v>>24;}
++static void service(void) {
++    apx_debug_poll();apx_uart_poll();apx_buttons_poll();apx_battery_poll();apx_display_poll();apx_camera_files_poll();apx_maintenance();
++}
++static void pause_ms(uint32_t ms) { uint32_t end=apx_ticks()+ms*33u; while(!apx_deadline_expired(end))service(); }
++static void tone(unsigned hz,unsigned ms) {
++    uint8_t in[12];put32(in,hz);put32(in+4,ms);put32(in+8,16000);
++    uint32_t r=command(apx_audio_command,1,in,12);if(r)printf("tone %u Hz: error %#lx\n",hz,(unsigned long)r);
++}
++static void result_beep(int ok) { if(ok)tone(2000,80);else tone(300,400); }
++/* Wait until the subsystem's INFO JSON contains `done` (or `fail`), servicing everything meanwhile. */
++static int wait_info(command_fn f,const char *done,const char *fail,uint32_t ms) {
++    uint32_t end=apx_ticks()+ms*33u;
++    while(!apx_deadline_expired(end)) {
++        service();command(f,0,NULL,0);
++        if(strstr((char *)reply,done))return 0;
++        if(fail&&strstr((char *)reply,fail))return -1;
++    }
++    return -2;
++}
++static unsigned file_number=1;
++static uint32_t save_new(command_fn f,unsigned save_command,const char *extension,char *path) {
++    for(unsigned tries=0;tries<1000;++tries,++file_number) {
++        snprintf(path,32,"0:/MO_%04u.%s",file_number,extension);
++        uint32_t r=command(f,save_command,path,strlen(path)+1);
++        if(r!=0x108u)return r;       /* 0x100+FR_EXIST: name taken, try the next one */
++    }
++    return 0x108u;
++}
++static void photo(void) {
++    uint8_t in[12];put32(in,640);put32(in+4,480);put32(in+8,8);
++    uint32_t r=command(apx_camera_command,2,in,12);
++    if(r){printf("photo: capture start error %#lx\n",(unsigned long)r);result_beep(0);return;}
++    int w=wait_info(apx_camera_command,"\"job\":4,","\"job\":5,",15000);
++    if(w){printf("photo: capture %s: %s\n",w==-2?"timeout":"failed",(char *)reply);result_beep(0);}
++    else {
++        char path[32];r=save_new(apx_camera_command,4,"JPG",path);
++        printf("photo: %s %s (%#lx)\n",path,r?"save failed":"saved",(unsigned long)r);result_beep(!r);
++    }
++    uint8_t on[4];put32(on,1);r=command(apx_camera_command,1,on,4);
++    if(r)printf("photo: preview restart error %#lx\n",(unsigned long)r);
++}
++static void recording(void) {
++    uint8_t in[8];put32(in,64000);put32(in+4,16000);
++    uint32_t r=command(apx_microphone_command,1,in,8);
++    if(r){printf("mic: start error %#lx\n",(unsigned long)r);result_beep(0);return;}
++    printf("mic: recording 2 s\n");
++    int w=wait_info(apx_microphone_command,"\"state\":3,","\"state\":4,",4000);
++    if(w){printf("mic: %s: %s\n",w==-2?"timeout":"failed",(char *)reply);result_beep(0);return;}
++    r=command(apx_microphone_command,5,NULL,0);
++    printf("mic: playback %s (%#lx)\n",r?"failed":"started",(unsigned long)r);
++    pause_ms(2300);
++    char path[32];r=save_new(apx_microphone_command,4,"WAV",path);
++    printf("mic: %s %s (%#lx)\n",path,r?"save failed":"saved",(unsigned long)r);result_beep(!r);
++}
++static void battery(void) {
++    struct apx_battery_info b;apx_battery_get_info(&b);
++    printf("battery: %lu mV valid %u level %u external %u adc %u/%u cal %u\n",(unsigned long)b.millivolts,b.valid,b.level,
++           b.external_power,b.adc_battery,b.adc_reference,b.calibration);
++    result_beep(b.valid);
++}
++int main(void) {
++    apx_trace(APX_TRACE_MAIN,0);
++    apx_usb_init();apx_buttons_init();apx_display_init();
++    int battery_error=apx_battery_init(),spi=apx_spi_init();
++    int audio=apx_audio_files_init(),mic=apx_microphone_files_init(),camera=apx_camera_files_init();
++    FRESULT sd=apx_storage_mount();
++    printf("MO2947 camera test, board %s\n",APX_BOARD_NAME);
++    printf("init: battery %d spi %d speaker %d microphone %d camera %d sd %d\n",battery_error,spi,audio,mic,camera,(int)sd);
++    command(apx_camera_command,0,NULL,0);printf("camera: %s\n",(char *)reply);
++    apx_led_set(1);
++    tone(1000,120);
++    uint32_t held_since=0,shown=0;unsigned power_armed=0,acted=0;
++    for(;;) {
++        service();
++        struct apx_button_event e;
++        while(apx_buttons_next(&e)) {
++            if(e.pressed&APX_BUTTON_SHUTTER)photo();
++            if(e.pressed&APX_BUTTON_UP)tone(880,300);
++            if(e.pressed&APX_BUTTON_DOWN)recording();
++            if(e.pressed&APX_BUTTON_RIGHT)battery();
++        }
++        struct apx_buttons_info b;apx_buttons_get_info(&b);
++        if(!(b.state&APX_BUTTON_POWER))power_armed=1;
++        if(b.state!=shown){shown=b.state;held_since=apx_ticks();acted=0;}
++        uint32_t held=apx_ticks()-held_since;
++        if(!acted&&shown==APX_BUTTON_LEFT&&held>65536u){acted=1;printf("LEFT held: boot ROM loader\n");apx_bootrom();}
++        if(!acted&&shown==APX_BUTTON_POWER&&power_armed&&held>65536u){acted=1;printf("POWER held: off\n");
++            uint32_t r=apx_power_off();printf("power off failed %#lx\n",(unsigned long)r);}
++    }
++}
+diff --git a/examples/mo2947-demo/main.c b/examples/mo2947-demo/main.c
+new file mode 100644
+index 0000000..2cfa43d
+--- /dev/null
++++ b/examples/mo2947-demo/main.c
+@@ -0,0 +1,60 @@
++/* MO2947 first SDK image: display (NV3030B through the 240x320 driver), buttons, LED, USB debug link.
++ * Colour bars, a red square at logical (0,0) to check the rotation, a centre square per key.
++ * Hold SHUTTER 2 s -> boot ROM USB loader (reflash). Hold POWER 2 s (after releasing it once) -> power off.
++ * The SDK's own cold-boot recovery also enters the loader when SHUTTER is held at power-on. */
++#include <appotech/soc.h>
++#include <appotech/display.h>
++#include <appotech/buttons.h>
++#include <appotech/usb.h>
++#include <appotech/debug.h>
++#include <appotech/power.h>
++#include <stdint.h>
++#include <stdio.h>
++#include "board.h"
++
++static void service(void) { apx_display_poll(); apx_buttons_poll(); apx_debug_poll(); }
++static int wait_display(void) {
++    while(apx_display_status()==APX_DISPLAY_BUSY||apx_display_status()==APX_DISPLAY_INITIALIZING)service();
++    return apx_display_status()==APX_DISPLAY_READY?0:-1;
++}
++static void fill(unsigned x,unsigned y,unsigned w,unsigned h,uint16_t c) {
++    if(!apx_display_fill(x,y,w,h,c))wait_display();
++}
++static uint16_t key_colour(uint32_t state) {
++    if(state&APX_BUTTON_SHUTTER)return 0xffff;   /* white */
++    if(state&APX_BUTTON_UP)return 0xf800;        /* red */
++    if(state&APX_BUTTON_DOWN)return 0x001f;      /* blue */
++    if(state&APX_BUTTON_LEFT)return 0x07e0;      /* green */
++    if(state&APX_BUTTON_RIGHT)return 0xffe0;     /* yellow */
++    if(state&APX_BUTTON_POWER)return 0xf81f;     /* magenta */
++    return 0x8410;                               /* grey */
++}
++int main(void) {
++    printf("MO2947 SDK demo, board %s\n",APX_BOARD_NAME);
++    apx_buttons_init();
++    apx_led_set(1);
++    apx_usb_init();
++    apx_display_init();
++    if(wait_display()) {
++        printf("display error\n");
++        for(uint32_t t=0;;++t) { apx_led_set((t>>12)&1); service(); }
++    }
++    unsigned w=apx_display_width(),h=apx_display_height();
++    static const uint16_t bars[8]={0xffff,0xffe0,0x07ff,0x07e0,0xf81f,0xf800,0x001f,0x0000};
++    for(unsigned i=0;i<8;++i)fill(i*w/8,0,w/8,h,bars[i]);
++    fill(0,0,30,30,0xf800);                     /* orientation: logical (0,0) should be top left */
++    printf("display %ux%u ready\n",w,h);
++
++    uint32_t shown=~0u,held_since=apx_ticks(),blink=apx_ticks();
++    int power_armed=0,led=1;
++    for(;;) {
++        service();
++        struct apx_buttons_info info;apx_buttons_get_info(&info);
++        if(info.state!=shown) { shown=info.state;held_since=apx_ticks();fill(w/2-50,h/2-50,100,100,key_colour(shown)); }
++        if(!(shown&APX_BUTTON_POWER))power_armed=1;
++        uint32_t held=apx_ticks()-held_since;
++        if(shown==APX_BUTTON_SHUTTER&&held>2u*32768u) { printf("SHUTTER held: boot ROM loader\n");apx_bootrom(); }
++        if(shown==APX_BUTTON_POWER&&power_armed&&held>2u*32768u) { printf("POWER held: off\n");apx_power_off(); }
++        if(apx_ticks()-blink>16384u) { blink=apx_ticks();led=!led;apx_led_set(led); }
++    }
++}
+diff --git a/include/appotech/soc.h b/include/appotech/soc.h
+index 6176d98..8453d45 100644
+--- a/include/appotech/soc.h
++++ b/include/appotech/soc.h
+@@ -2,12 +2,28 @@
+ #define APPOTECH_SOC_H
+ #include <stdint.h>
+ #include <stddef.h>
++/* A board can replace the memory map with its own board_memory.h (MO2947: 2 MiB, flash-booted image at 0x02000000). */
++#if defined(__has_include)
++#if __has_include("board_memory.h")
++#include "board_memory.h"
++#endif
++#endif
++#ifndef APX_RAM_END
+ #define APX_RAM_BASE 0x02000000u
+ #define APX_RAM_END 0x02400000u
+ #define APX_RUNTIME_BASE 0x02180000u
+ #define APX_RUNTIME_END 0x021a0000u
+ #define APX_STACK_BASE 0x02200000u
+ #define APX_STACK_END 0x02204000u
++#define APX_LCD_DMA_BASE 0x02210000u
++#define APX_LCD_DMA_END 0x02220000u
++#define APX_EXTRA_RAM_BASE 0x02220000u
++#define APX_EXTRA_RAM_END 0x022e0000u
++#define APX_LOW_RAM_BASE 0x02080000u
++#define APX_LOW_RAM_END 0x02100000u
++#define APX_CODEC_RAM_BASE 0x022e0000u
++#define APX_CODEC_RAM_END 0x02400000u
++#endif
+ static inline void apx_cpu_relax(void) { __asm__ volatile("l.nop"); }
+ static inline uint8_t apx_mmio_read8(uintptr_t address) { return *(volatile uint8_t *)address; }
+ static inline uint16_t apx_mmio_read16(uintptr_t address) { return *(volatile uint16_t *)address; }
+diff --git a/linker/mo2947.ld b/linker/mo2947.ld
+new file mode 100644
+index 0000000..80fc8ab
+--- /dev/null
++++ b/linker/mo2947.ld
+@@ -0,0 +1,34 @@
++/* MO2947 (AX3295B, 2 MiB SDRAM), flash-booted through the unchanged stock header and bootstrap.
++ * The boot ROM loads flash 0x2200.. (0x7A400 bytes) to 0x02000000 and the bootstrap calls 0x020004A8, so every
++ * file-backed section must end below 0x0207A400 and the bootstrap call target must sit exactly at 0x020004A8.
++ * The NOLOAD sections follow the image directly (cleared at start-up by apx_runtime_init / apx_spi_boot_prepare).
++ * Must match boards/mo2947/board_memory.h. */
++ENTRY(apx_spi_entry)
++MEMORY { RAM (rwx)  : ORIGIN = 0x02000000, LENGTH = 0x1fc000
++         STACK (rw) : ORIGIN = 0x021fc000, LENGTH = 16K }
++__heap_size = DEFINED(APX_HEAP_SIZE) ? APX_HEAP_SIZE : 16K;
++SECTIONS {
++ .entry 0x02000000 : { KEEP(*(.text.entry)) } > RAM
++ .bootstrap_call 0x020004a8 : { KEEP(*(.text.mo2947_bootstrap_call)) } > RAM
++ .text : ALIGN(4) { FILL(0x00000015) *(.text .text.*) } > RAM
++ .rodata : ALIGN(4) { *(.rodata .rodata.*) } > RAM
++ .fatfs_tables : ALIGN(4) { __fatfs_tables_start = .; __fatfs_tables_end = .; } > RAM
++ .data : ALIGN(4) { __data_start = .; *(.data .data.* .sdata .sdata.*) __data_end = .; } > RAM
++ __data_source = LOADADDR(.data);
++ __image_end = .;
++ __extra_ram_start = 0; __extra_ram_end = 0;
++ .bss (NOLOAD) : ALIGN(32) { __bss_start = .; *(.bss .bss.* .sbss .sbss.* COMMON) __bss_end = .; } > RAM
++ .extra_bss (NOLOAD) : ALIGN(32) { __extra_bss_start = .; *(.extra_bss .extra_bss.*) __extra_bss_end = .; } > RAM
++ .noinit (NOLOAD) : ALIGN(8) { *(.noinit .noinit.*) } > RAM
++ .heap (NOLOAD) : ALIGN(8) { __heap_start = .; . += __heap_size; __heap_end = .; } > RAM
++ __runtime_used_end = .;
++ .display_dma (NOLOAD) : ALIGN(32) { __display_dma_start = .; *(.display_dma) __display_dma_end = .; } > RAM
++ .large_buffer (NOLOAD) : ALIGN(32) { __large_buffer_start = .; *(.large_buffer) __large_buffer_end = .; } > RAM
++ .jpeg_buffer (NOLOAD) : ALIGN(32) { __jpeg_buffer_start = .; *(.jpeg_buffer) __jpeg_buffer_end = .; } > RAM
++ __ram_used_end = .;
++ .stack (NOLOAD) : { __stack_bottom = .; . += LENGTH(STACK); __stack_top = .; } > STACK
++ /DISCARD/ : { *(.eh_frame*) *(.comment) *(.note*) }
++}
++ASSERT(mo2947_bootstrap_call == 0x020004a8, "bootstrap call target must be at 0x020004a8")
++ASSERT(SIZEOF(.entry) <= 0x4a8, "start-up code overlaps the bootstrap call target")
++ASSERT(__image_end <= 0x0207a400, "image larger than the 0x7A400 bytes the stock header loads")
+diff --git a/src/camera.c b/src/camera.c
+index 4ef264b..2ea8407 100644
+--- a/src/camera.c
++++ b/src/camera.c
+@@ -231,6 +231,11 @@ int apx_camera_init(void) {
+  apx_delay_ms(50);
+  unsigned enable=selected==APX_CAMERA_REAR?APX_CAMERA_REAR_ENABLE_MASK:APX_CAMERA_FRONT_ENABLE_MASK;
+  apx_gpio_write(4,enable,0);apx_delay_ms(50);
++#elif APX_SENSOR_RESET_PD1
++ /* MO2947 stock sensor_pins_init 0x02002CA8: PD0 (power-down) low, PD1 (reset, active low) high.
++  * Hold PD1 low for 10 ms first (a reset pulse), then release it as stock leaves it. */
++ apx_gpio_configure(3,3,APX_GPIO_OUTPUT,APX_GPIO_FLOATING,0);
++ apx_delay_ms(10);apx_gpio_write(3,2,2);apx_delay_ms(50);
+ #else
+  /* 02003144: sensor power-down low and a low/high/low reset pulse. */
+  apx_gpio_configure(3,3,APX_GPIO_OUTPUT,APX_GPIO_FLOATING,0);
+@@ -256,7 +261,10 @@ int apx_camera_init(void) {
+  apx_spr_write(0x9090,71);
+ #endif
+  update(0x9094,0x80,0x80);
+- update(0x8868,0x1fff,0x182e);apx_delay_ms(20);
++#ifndef APX_SENSOR_LDO
++#define APX_SENSOR_LDO 0x182eu /* Action/DOOM board */
++#endif
++ update(0x8868,0x1fff,APX_SENSOR_LDO);apx_delay_ms(20);
+  apx_trace(APX_TRACE_APP_BASE+0x10,0); /* sensor powered and clocked */
+ #if APX_BOARD_SILVERGEAR
+  const struct sensor_profile *profile=NULL;
+diff --git a/src/clock.c b/src/clock.c
+index a390723..fdc7de2 100644
+--- a/src/clock.c
++++ b/src/clock.c
+@@ -12,6 +12,13 @@ static int profile(unsigned mhz) {
+  return apx_spr_read(0x8858)==(mhz==144?0x1123u:0x1623u)&&
+   apx_spr_read(0x885c)==(mhz==144?0x112a8800u:0x0b71b000u);
+ }
++/* APX_CLOCK_INHERIT (MO2947, AX3295B boot ROM): the bootstrap's PLL1 pair is not one of the JT5295 pairs above
++ * (cold boot refused with code 1, seen on the device 2026-11-12). Run on the inherited clock, never switch the PLL,
++ * and hand it back unchanged (the stock app does the same; returning to the loader that way is verified). */
++#ifndef APX_CLOCK_INHERIT
++#define APX_CLOCK_INHERIT 0
++#endif
++static int known_pll(void) { return APX_CLOCK_INHERIT||profile(144)||profile(96); }
+ /* Cold SPI boot: the preserved SRAM bootstrap leaves PLL1 at the 144 MHz pair
+  * and the reference counter at 0x701. That already is the SDK's run clock, so
+  * nothing is switched here: only the counter is normalized. (An earlier version
+@@ -22,7 +29,7 @@ static int profile(unsigned mhz) {
+ /* Returns 0, or why the incoming state was refused: 1 PLL pair, 2 timer control, 3 timer period, 4 timer control write never read back. */
+ int apx_clock_prepare_spi(void) {
+  uint32_t timer=apx_spr_read(0x9800);
+- if(!profile(144)&&!profile(96))return 1;
++ if(!known_pll())return 1;
+  if(timer!=0x701&&timer!=0x721)return 2;
+  if(apx_spr_read(0x9808)!=0x3fff)return 3;
+  /* The timer control is in the 32 kHz domain and accepts a write only some time after reset, not after SPI entry:
+@@ -44,7 +51,7 @@ int apx_clock_init(void) {
+  info.requested_mhz=APX_CPU_MHZ;
+  /* Only the known pairs and timer are accepted. USB-owned routing, PLL2,
+   * dividers, RAM timing, timer, cache and IRQ fields stay untouched. */
+- if((!profile(96)&&!profile(144))||apx_spr_read(0x9800)!=0x721||apx_spr_read(0x9808)!=0x3fff)return info.error=1;
++ if(!known_pll()||apx_spr_read(0x9800)!=0x721||apx_spr_read(0x9808)!=0x3fff)return info.error=1;
+  apx_trace(APX_TRACE_CLOCK_STEP,0x100000u|profile(96)<<4|profile(144)); /* entry: which pair is live */
+  if(profile(96)) {
+   /* USB launch: the loader pair, measured before and after the switch.
+@@ -76,6 +83,7 @@ int apx_clock_init(void) {
+ }
+ int apx_clock_restore(void) {
+  if(!initialized)return info.error?info.error:1;
++ if(APX_CLOCK_INHERIT&&!profile(144)&&!profile(96)) { initialized=0;return info.error=0; } /* inherited: leave it */
+  if(!profile(APX_CPU_MHZ))return info.error=1;
+ #if APX_CPU_MHZ == 144
+  apx_clock_apply_96();
+diff --git a/src/debug.c b/src/debug.c
+index 3dd1a8b..3ce3129 100644
+--- a/src/debug.c
++++ b/src/debug.c
+@@ -60,14 +60,14 @@ void apx_debug_reset(void) { received=expected=pending_action=0; }
+ static int protected_range(uint32_t address,uint32_t length) {
+     return (address<APX_RUNTIME_END && (address>=APX_RUNTIME_BASE || length>APX_RUNTIME_BASE-address)) ||
+            (address<APX_STACK_END && (address>=APX_STACK_BASE || length>APX_STACK_BASE-address)) ||
+-           ((uintptr_t)__display_dma_end>(uintptr_t)__display_dma_start && address<0x02220000u &&
+-            (address>=0x02210000u || length>0x02210000u-address)) ||
+-           ((uintptr_t)__extra_ram_end>(uintptr_t)__extra_ram_start && address<0x022e0000u &&
+-            (address>=0x02220000u || length>0x02220000u-address)) ||
+-           ((uintptr_t)__large_buffer_end>(uintptr_t)__large_buffer_start && address<0x02100000u &&
+-            (address>=0x02080000u || length>0x02080000u-address)) ||
+-           ((uintptr_t)__jpeg_buffer_end>(uintptr_t)__jpeg_buffer_start && address<0x02400000u &&
+-            (address>=0x022e0000u || length>0x022e0000u-address));
++           ((uintptr_t)__display_dma_end>(uintptr_t)__display_dma_start && address<APX_LCD_DMA_END &&
++            (address>=APX_LCD_DMA_BASE || length>APX_LCD_DMA_BASE-address)) ||
++           ((uintptr_t)__extra_ram_end>(uintptr_t)__extra_ram_start && address<APX_EXTRA_RAM_END &&
++            (address>=APX_EXTRA_RAM_BASE || length>APX_EXTRA_RAM_BASE-address)) ||
++           ((uintptr_t)__large_buffer_end>(uintptr_t)__large_buffer_start && address<APX_LOW_RAM_END &&
++            (address>=APX_LOW_RAM_BASE || length>APX_LOW_RAM_BASE-address)) ||
++           ((uintptr_t)__jpeg_buffer_end>(uintptr_t)__jpeg_buffer_start && address<APX_CODEC_RAM_END &&
++            (address>=APX_CODEC_RAM_BASE || length>APX_CODEC_RAM_BASE-address));
+ }
+ static void dispatch(void) {
+     uint32_t address=get32(request+12),length=get32(request+16),status=APXD_OK,output=0;
+diff --git a/src/display.c b/src/display.c
+index 89236dc..ec45935 100644
+--- a/src/display.c
++++ b/src/display.c
+@@ -207,7 +207,7 @@ int apx_display_blit_dma(unsigned x,unsigned y,unsigned w,unsigned h,const uint1
+     uint64_t bytes=(uint64_t)w*h*2;
+     if(address&1 || !bytes || (w|h)&1 || address<APX_RAM_BASE || address>=APX_RAM_END ||
+        bytes>APX_RAM_END-address)return -1;
+-    if(address<0x02220000u && address+bytes>0x02210000u)return -1;
++    if(address<APX_LCD_DMA_END && address+bytes>APX_LCD_DMA_BASE)return -1;
+     if(queue(x,y,w,h)<0)return -1;
+     source=pixels;stride=w;filling=0;dma=1;return 0;
+ }
+diff --git a/src/display_st7789.c b/src/display_st7789.c
+index 26f3b71..cd56a58 100644
+--- a/src/display_st7789.c
++++ b/src/display_st7789.c
+@@ -51,6 +51,14 @@ static void settle(void) {
+     for(unsigned i=0;i<200;++i)apx_cpu_relax();
+ }
+ static void panel_reset(int high) {
++#if APX_LCD_RESET_MASK
++    /* MO2947 (as Action): reset is a GPIO (PB6), stock lcd_reset 0x02002C30. */
++    apx_spr_write(0x8380u+4u*APX_LCD_RESET_GROUP,apx_spr_read(0x8380u+4u*APX_LCD_RESET_GROUP)|APX_LCD_RESET_MASK);
++    update(0x8100u+4u*APX_LCD_RESET_GROUP,APX_LCD_RESET_MASK,0);
++    update(0x8040u+4u*APX_LCD_RESET_GROUP,APX_LCD_RESET_MASK,0);
++    gpio_write(APX_LCD_RESET_GROUP,APX_LCD_RESET_MASK,high);
++    return;
++#endif
+     /* Stock 02002ef8 -> 02034d2c -> 0202c654: dedicated reset output,
+      * selector 2 in 886c[29:27]; this is not PB1 GPIO. */
+     if(high) {
+@@ -61,8 +69,17 @@ static void panel_reset(int high) {
+     }
+ }
+ void apx_display_backlight(int enabled) {
++#if APX_LCD_BACKLIGHT_MASK
++    /* MO2947: PA6 as a plain GPIO output, full brightness (stock drives it by PWM timer 2; verified on/off by GPIO). */
++    if(state==APX_DISPLAY_OFF)return;
++    apx_spr_write(0x8380u+4u*APX_LCD_BACKLIGHT_GROUP,apx_spr_read(0x8380u+4u*APX_LCD_BACKLIGHT_GROUP)|APX_LCD_BACKLIGHT_MASK);
++    update(0x8100u+4u*APX_LCD_BACKLIGHT_GROUP,APX_LCD_BACKLIGHT_MASK,0);
++    update(0x8040u+4u*APX_LCD_BACKLIGHT_GROUP,APX_LCD_BACKLIGHT_MASK,0);
++    gpio_write(APX_LCD_BACKLIGHT_GROUP,APX_LCD_BACKLIGHT_MASK,enabled);
++#else
+     if(state!=APX_DISPLAY_OFF && apx_power_update(0x54,0x40,enabled?0x40:0))
+         state=APX_DISPLAY_ERROR;
++#endif
+ }
+ void apx_display_shutdown(void) {
+     if(state==APX_DISPLAY_OFF)return;
+@@ -183,7 +200,7 @@ int apx_display_blit_dma(unsigned x,unsigned y,unsigned w,unsigned h,const uint1
+     uint64_t bytes=(uint64_t)w*h*2;
+     if(address&1 || !bytes || (w|h)&1 || address<APX_RAM_BASE || address>=APX_RAM_END ||
+        bytes>APX_RAM_END-address)return -1;
+-    if(address<0x02220000u && address+bytes>0x02210000u)return -1;
++    if(address<APX_LCD_DMA_END && address+bytes>APX_LCD_DMA_BASE)return -1;
+     if(queue(x,y,w,h)<0)return -1;
+     source=pixels;stride=w;filling=0;dma=1;return 0;
+ }
+diff --git a/src/power.c b/src/power.c
+index bcc54e6..53e161f 100644
+--- a/src/power.c
++++ b/src/power.c
+@@ -59,7 +59,10 @@ int apx_power_domain_enable(void) {
+        apx_power_update(0x5a,0x08,0x08))return -1;
+ #else
+     apx_spr_write(PM_CONTROL,apx_spr_read(PM_CONTROL)|0x40);
+-    if(write(0x41,0x06))return -1; /* stock 02026624(1): register 0x40 = 6 */
++#ifndef APX_PM40_HOLD
++#define APX_PM40_HOLD 0x06u /* stock 02026624(1): register 0x40 = 6 */
++#endif
++    if(write(0x41,APX_PM40_HOLD))return -1;
+     if(write(0x43,0xe0)||write(0x45,0x00))return -1; /* stock 02026818(1) follows */
+     if(apx_power_read(0x58,&value)||write(0x59,value|0x08))return -1;
+     if(apx_power_read(0x40,&value)||write(0x41,value|0x10))return -1; /* 0x06|0x10 = 0x16 */
+diff --git a/src/runtime.c b/src/runtime.c
+index d481ee8..d5d31c6 100644
+--- a/src/runtime.c
++++ b/src/runtime.c
+@@ -227,7 +227,7 @@ _Noreturn void _exit(int status) {
+ static _Noreturn void apx_jump_to_rom(uint32_t stack) {
+     __asm__ volatile(
+         "l.movhi r3,0x0200\n\t"          /* DDR start 0x02000000 */
+-        "l.movhi r4,0x0240\n\t"          /* DDR end   0x02400000 */
++        "l.movhi r4,%1\n\t"              /* DDR end (APX_RAM_END) */
+         "l.addi r5,r0,255\n\t"           /* 256 lines of 16 bytes = 4096 bytes */
+         "1:\n\t"
+         "l.mtspr r0,r5,0x181c\n\t"
+@@ -252,7 +252,7 @@ static _Noreturn void apx_jump_to_rom(uint32_t stack) {
+         "l.ori r9,r9,0x385c\n\t"
+         "l.jr r9\n\t"
+         "l.nop"
+-        :: "r"(stack) : "r3","r4","r5","r6","r7","r8","r9","memory");
++        :: "r"(stack),"i"(APX_RAM_END>>16) : "r3","r4","r5","r6","r7","r8","r9","memory");
+     __builtin_unreachable();
+ }
+ void apx_jump_to_rom_from_boot(uint32_t stack) { apx_jump_to_rom(stack); }
+diff --git a/src/spi_overlay.c b/src/spi_overlay.c
+index b95e8f3..10d9d27 100644
+--- a/src/spi_overlay.c
++++ b/src/spi_overlay.c
+@@ -6,8 +6,8 @@
+ #include <string.h>
+ #define TABLE 0x1fc000u
+ #define MAGIC 0x4f585041u /* 'APXO' */
+-#define BANK_START 0x022e0000u
+-#define BANK_END 0x02400000u
++#define BANK_START APX_CODEC_RAM_BASE
++#define BANK_END APX_CODEC_RAM_END
+ #define CHUNK 32768u
+ #ifndef APX_OVERLAY_PTR
+ #define APX_OVERLAY_PTR(address) ((uint8_t *)(uintptr_t)(address))
+diff --git a/src/storage.c b/src/storage.c
+index 693e433..0020388 100644
+--- a/src/storage.c
++++ b/src/storage.c
+@@ -71,7 +71,11 @@ uint32_t apx_storage_command(unsigned cmd,const uint8_t *in,size_t len,uint8_t *
+     }
+     if(cmd==APX_STORAGE_CODEPAGE) {
+         if(len!=4||get32(in)>65535)return APXD_INVALID;
++#if FF_CODE_PAGE == 0
+         return failure(f_setcp((WORD)get32(in)));
++#else
++        return APXD_UNSUPPORTED; /* fixed code page build */
++#endif
+     }
+     if(cmd==APX_STORAGE_UNMOUNT||cmd==APX_STORAGE_SYNC) {
+         if(len)return APXD_INVALID;
+diff --git a/third_party/fatfs/ffconf.h b/third_party/fatfs/ffconf.h
+index 0db6a24..f31e419 100644
+--- a/third_party/fatfs/ffconf.h
++++ b/third_party/fatfs/ffconf.h
+@@ -84,7 +84,11 @@
+ / Locale and Namespace Configurations
+ /---------------------------------------------------------------------------*/
+ 
++#ifdef APX_FATFS_CODE_PAGE /* MO2947: one fixed code page; the dynamic tables (about 478 KB) do not fit the boot ROM's load window */
++#define FF_CODE_PAGE	APX_FATFS_CODE_PAGE
++#else
+ #define FF_CODE_PAGE	0
++#endif
+ /* This option specifies the OEM code page to be used on the target system.
+ /  Incorrect code page setting can cause a file open failure.
+ /
+-- 
+2.56.1
+
+
+From cc6f26710adad87861364c8ef148b70a1d7bae21 Mon Sep 17 00:00:00 2001
+From: Samuel Steinhart <ssteinhart@student.tgm.ac.at>
+Date: Thu, 12 Nov 2026 23:07:00 +0100
+Subject: [PATCH 2/4] mo2947-camera: USB drive, webcam and USB microphone modes
+
+UP cycles the USB mode: debug link (1908:3319) -> mass storage with the SD card
+writable (1908:3318) -> webcam (UVC MJPEG 640x480/320x240) + USB microphone
+(UAC, 32 kHz) + SD card read-only (1908:3317) -> debug link. The webcam
+pipeline comes from examples/uvc-camera (webcam.inc, statistics removed).
+
+2 MiB does not hold the camera app's buffers and the webcam's at once, and
+they never run together: linker/mo2947.ld places the webcam buffers (.uvc_ws)
+over .jpeg_buffer. That needs --no-check-sections for this board's link; the
+script's asserts replace the overlap check (section order, RAM end below the
+stack).
+
+Verified on the device 2026-11-12: drive mounts and the files open, webcam
+picture in a host camera app, USB microphone records, back to the preview.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Makefile                           |   5 +-
+ examples/mo2947-camera/features.mk |   3 +
+ examples/mo2947-camera/main.c      | 113 ++++++++--
+ examples/mo2947-camera/webcam.inc  | 332 +++++++++++++++++++++++++++++
+ linker/mo2947.ld                   |   9 +-
+ 5 files changed, 443 insertions(+), 19 deletions(-)
+ create mode 100644 examples/mo2947-camera/features.mk
+ create mode 100644 examples/mo2947-camera/webcam.inc
+
+diff --git a/Makefile b/Makefile
+index b4a92ab..245661f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -97,6 +97,9 @@ LVGL_ENABLED := $(filter lvgl-demo,$(EXAMPLE))
+ LINKER_SCRIPT := $(if $(filter mo2947,$(BOARD)),linker/mo2947.ld,$(if $(LVGL_ENABLED),$(BUILD)/ram-compact.ld,linker/ram.ld))
+ # MO2947: flash-booted at 0x02000000 through the stock bootstrap (its call target 0x020004a8 jumps to apx_spi_entry).
+ BOARD_OBJECTS := $(if $(filter mo2947,$(BOARD)),$(BUILD)/mo2947_entry.o $(BUILD)/mo2947_early.o)
++# mo2947.ld overlaps .uvc_ws with .jpeg_buffer on purpose; its own asserts replace the overlap check.
++comma := ,
++BOARD_LDFLAGS := $(if $(filter mo2947,$(BOARD)),-Wl$(comma)--no-check-sections)
+ LVGL_DEMO ?= benchmark
+ # LVGL performance monitor (FPS/CPU/refresh in the benchmark's scene label): on for the benchmark, off for widgets.
+ LVGL_PERF ?= $(if $(filter benchmark,$(LVGL_DEMO)),1,0)
+@@ -266,7 +269,7 @@ $(BUILD)/libappotech.a: $(OBJECTS)
+ 	rm -f $@ # ar rcs updates in place: a stale usb.o from an earlier USB_STACK would stay in the archive and could win the link
+ 	$(AR) rcs $@ $^
+ $(BUILD)/$(EXAMPLE).elf: $(BUILD)/startup.o $(BOARD_OBJECTS) $(BUILD)/main.o $(BUILD)/libappotech.a $(BUILD)/libfatfs.a $(LVGL_LIB) $(LINKER_SCRIPT) $(LIBC) $(LIBGCC)
+-	$(CC) $(CFLAGS) $(LTO_LDFLAGS) -nostartfiles -T$(LINKER_SCRIPT) -Wl,-e,_start,--gc-sections,--build-id=none,--defsym=APX_HEAP_SIZE=$(HEAP_SIZE),-Map,$(BUILD)/$(EXAMPLE).map -o $@ $(filter %.o,$^) -Wl,--start-group $(BUILD)/libappotech.a $(BUILD)/libfatfs.a $(LVGL_LIB) -Wl,--end-group
++	$(CC) $(CFLAGS) $(LTO_LDFLAGS) $(BOARD_LDFLAGS) -nostartfiles -T$(LINKER_SCRIPT) -Wl,-e,_start,--gc-sections,--build-id=none,--defsym=APX_HEAP_SIZE=$(HEAP_SIZE),-Map,$(BUILD)/$(EXAMPLE).map -o $@ $(filter %.o,$^) -Wl,--start-group $(BUILD)/libappotech.a $(BUILD)/libfatfs.a $(LVGL_LIB) -Wl,--end-group
+ 	$(OBJDUMP) -d $@ > $(BUILD)/$(EXAMPLE).disasm
+ 	$(SIZE) $@
+ $(BUILD)/$(EXAMPLE).manifest.json: $(BUILD)/$(EXAMPLE).elf tools/manifest.py tools/check_clock_elf.py
+diff --git a/examples/mo2947-camera/features.mk b/examples/mo2947-camera/features.mk
+new file mode 100644
+index 0000000..b78e82f
+--- /dev/null
++++ b/examples/mo2947-camera/features.mk
+@@ -0,0 +1,3 @@
++# MO2947 camera test image: debug link + mass storage + webcam (UVC) + USB microphone (UAC).
++APX_USB_UVC ?= 1
++APX_USB_UAC ?= 1
+diff --git a/examples/mo2947-camera/main.c b/examples/mo2947-camera/main.c
+index 87efd7a..be44e99 100644
+--- a/examples/mo2947-camera/main.c
++++ b/examples/mo2947-camera/main.c
+@@ -1,17 +1,23 @@
+-/* MO2947 combined test image: everything in one flash install.
+- * Base: the SDK's Action camera app (live preview; every subsystem reachable over the USB debug link with
++/* MO2947 camera image: live preview, photos, recordings, USB modes.
++ * Base: the SDK's Action camera app (every subsystem is also reachable over the USB debug link with
+  * tools/mo2947_apxd.py: STORAGE, CAMERA, JPEG, AUDIO, MICROPHONE, BATTERY, SPI).
+- * Keys on the camera (each action is logged; read with "mo2947_apxd.py log"):
+- *   SHUTTER         photo 640x480 -> SD 0:/MO_nnnn.JPG (new files only)
+- *   UP              speaker tone 880 Hz
+- *   DOWN            record 2 s (16 kHz), play it back, save 0:/MO_nnnn.WAV
++ *
++ * USB modes (UP cycles through them; the camera re-enumerates each time):
++ *   debug link    1908:3319  "JT5295 SDK Debug" (start-up mode; tools/mo2947_apxd.py)          LED on
++ *   USB drive     1908:3318  the SD card, writable (eject it on the PC before switching back)  LED fast blink, blue square
++ *   webcam        1908:3317  UVC MJPEG 640x480/320x240 + USB microphone + SD card read-only    LED slow blink, dark red screen
++ * Keys:
++ *   SHUTTER         photo 640x480 -> SD 0:/MO_nnnn.JPG (debug-link mode only; new files only)
++ *   DOWN            record 2 s (16 kHz), play it back, save 0:/MO_nnnn.WAV (debug-link mode only)
++ *   UP              next USB mode
+  *   RIGHT           battery voltage to the log
+  *   hold LEFT 2 s   boot ROM USB loader (reflash)
+  *   hold POWER 2 s  power off (after releasing it once)
+- * Beeps: short high = done, long low = failed. Hold SHUTTER at power-on: loader (early escape, before the SDK). */
++ * Beeps (speaker): short high = done, long low = failed. Hold SHUTTER at power-on: loader (early escape). */
+ #include <appotech/soc.h>
+ #include "board.h"
+ #include <appotech/usb.h>
++#include <appotech/usb_msc.h>
+ #include <appotech/debug.h>
+ #include <appotech/display.h>
+ #include <appotech/buttons.h>
+@@ -27,6 +33,11 @@
+ #include <appotech/storage.h>
+ #include <stdio.h>
+ #include <string.h>
++#include "webcam.inc"
++
++enum mode { MODE_DEBUG, MODE_DRIVE, MODE_WEBCAM };
++static const char *const mode_name[] = { "debug link", "USB drive (SD card, writable)", "webcam + microphone (SD read-only)" };
++static enum mode mode;
+ 
+ typedef uint32_t (*command_fn)(unsigned,const uint8_t *,size_t,uint8_t *,size_t *);
+ static uint8_t reply[APXD_MAX_PAYLOAD+1];
+@@ -35,8 +46,21 @@ static uint32_t command(command_fn f,unsigned c,const void *in,size_t len) {
+     reply[n<APXD_MAX_PAYLOAD?n:APXD_MAX_PAYLOAD]=0;return r;
+ }
+ static void put32(uint8_t *p,uint32_t v){p[0]=v;p[1]=v>>8;p[2]=v>>16;p[3]=v>>24;}
++
++/* Blue square in the top right corner of the preview while the SD card is a USB drive. NV21: Y plane, then V,U pairs. */
++void apx_camera_preview_overlay(uint8_t *y,uint8_t *vu,unsigned pitch) {
++    if(mode!=MODE_DRIVE)return;
++    for(unsigned row=8;row<32;++row)for(unsigned x=284;x<308;++x)y[row*pitch+x]=41;
++    for(unsigned row=4;row<16;++row)for(unsigned x=284;x<308;x+=2){vu[row*pitch+x]=110;vu[row*pitch+x+1]=240;}
++}
++
+ static void service(void) {
+-    apx_debug_poll();apx_uart_poll();apx_buttons_poll();apx_battery_poll();apx_display_poll();apx_camera_files_poll();apx_maintenance();
++    if(mode==MODE_WEBCAM) {
++        apx_usb_poll();(void)apx_camera_service();tick_capture();watch_host();tick_send();tick_encode();
++        apx_buttons_poll();apx_battery_poll();apx_display_poll();apx_maintenance();
++    } else {
++        apx_debug_poll();apx_uart_poll();apx_buttons_poll();apx_battery_poll();apx_display_poll();apx_camera_files_poll();apx_maintenance();
++    }
+ }
+ static void pause_ms(uint32_t ms) { uint32_t end=apx_ticks()+ms*33u; while(!apx_deadline_expired(end))service(); }
+ static void tone(unsigned hz,unsigned ms) {
+@@ -44,7 +68,6 @@ static void tone(unsigned hz,unsigned ms) {
+     uint32_t r=command(apx_audio_command,1,in,12);if(r)printf("tone %u Hz: error %#lx\n",hz,(unsigned long)r);
+ }
+ static void result_beep(int ok) { if(ok)tone(2000,80);else tone(300,400); }
+-/* Wait until the subsystem's INFO JSON contains `done` (or `fail`), servicing everything meanwhile. */
+ static int wait_info(command_fn f,const char *done,const char *fail,uint32_t ms) {
+     uint32_t end=apx_ticks()+ms*33u;
+     while(!apx_deadline_expired(end)) {
+@@ -95,33 +118,89 @@ static void battery(void) {
+            b.external_power,b.adc_battery,b.adc_reference,b.calibration);
+     result_beep(b.valid);
+ }
++
++/* ---- USB modes ---- */
++static void fill_screen(uint16_t colour) {
++    uint32_t end=apx_ticks()+32768u;
++    while(apx_display_status()==APX_DISPLAY_BUSY&&!apx_deadline_expired(end))apx_display_poll();
++    if(!apx_display_fill(0,0,apx_display_width(),apx_display_height(),colour))
++        while(apx_display_status()==APX_DISPLAY_BUSY)apx_display_poll();
++}
++static void webcam_reset(void) {
++    for(unsigned i=0;i<2;++i){nv[i].state=NV_FREE;js[i].state=J_FREE;}
++    cap_i=enc_i=0;
++}
++/* Back to the debug link from any mode: the SD card becomes the camera's again, the preview restarts. */
++static void leave_mode(void) {
++    if(mode==MODE_DEBUG)return;
++    enum mode old=mode;
++    if(old==MODE_WEBCAM){apx_usb_uac_set_service(NULL);if(mic_running){apx_mic_stop();mic_running=0;}apx_camera_stop();apx_jpeg_shutdown();webcam_reset();}
++    mode=MODE_DEBUG;
++    if(apx_usb_set_mode(APX_USB_MODE_DEBUG))printf("usb: switch to debug link failed\n");
++    FRESULT sd=apx_storage_mount();
++    int cam=old==MODE_WEBCAM?apx_camera_files_init():0;
++    printf("usb: %s (sd %d, camera %d)\n",mode_name[mode],(int)sd,cam);
++    apx_led_set(1);
++}
++static int enter_drive(void) {
++    int r=apx_usb_msc_use_sd_writable();
++    if(r){printf("usb drive: SD card not available (%d)\n",r);apx_storage_mount();return -1;}
++    mode=MODE_DRIVE;
++    if(apx_usb_set_mode(APX_USB_MODE_MSC)){printf("usb drive: mode unavailable\n");mode=MODE_DEBUG;apx_storage_mount();return -1;}
++    return 0;
++}
++static int enter_webcam(void) {
++    uint32_t end=apx_ticks()+65536u;
++    while(apx_camera_files_suspend()==APX_CAMERA_BUSY&&!apx_deadline_expired(end))service();
++    int cam=apx_camera_init();
++    if(cam){printf("webcam: camera init %d\n",cam);apx_camera_files_init();return -1;}
++    if(apx_usb_msc_use_sd())apx_usb_msc_set_disk(NULL);          /* SD read-only, or the RAM disk without a card */
++    int mic=apx_mic_init();
++    webcam_reset();
++    fill_screen(0x3800);                                           /* dark red: the picture goes to the PC */
++    apx_usb_uac_set_service(tick_audio);
++    mode=MODE_WEBCAM;
++    if(apx_usb_set_mode(APX_USB_MODE_CAMERA)){printf("webcam: mode unavailable\n");leave_mode();return -1;}
++    (void)mic;return 0;
++}
++static void next_mode(void) {
++    enum mode want=mode==MODE_DEBUG?MODE_DRIVE:mode==MODE_DRIVE?MODE_WEBCAM:MODE_DEBUG;
++    leave_mode();
++    int r=want==MODE_DRIVE?enter_drive():want==MODE_WEBCAM?enter_webcam():0;
++    printf("usb: %s%s\n",mode_name[mode],r?" (requested mode failed)":"");
++    result_beep(!r);
++}
++
+ int main(void) {
+     apx_trace(APX_TRACE_MAIN,0);
+     apx_usb_init();apx_buttons_init();apx_display_init();
+     int battery_error=apx_battery_init(),spi=apx_spi_init();
+     int audio=apx_audio_files_init(),mic=apx_microphone_files_init(),camera=apx_camera_files_init();
+     FRESULT sd=apx_storage_mount();
+-    printf("MO2947 camera test, board %s\n",APX_BOARD_NAME);
++    printf("MO2947 camera, board %s\n",APX_BOARD_NAME);
+     printf("init: battery %d spi %d speaker %d microphone %d camera %d sd %d\n",battery_error,spi,audio,mic,camera,(int)sd);
+-    command(apx_camera_command,0,NULL,0);printf("camera: %s\n",(char *)reply);
+     apx_led_set(1);
+     tone(1000,120);
+-    uint32_t held_since=0,shown=0;unsigned power_armed=0,acted=0;
++    uint32_t held_since=0,shown=0,blink=apx_ticks();unsigned power_armed=0,acted=0,led=1;
+     for(;;) {
+         service();
+         struct apx_button_event e;
+         while(apx_buttons_next(&e)) {
+-            if(e.pressed&APX_BUTTON_SHUTTER)photo();
+-            if(e.pressed&APX_BUTTON_UP)tone(880,300);
+-            if(e.pressed&APX_BUTTON_DOWN)recording();
++            if(e.pressed&APX_BUTTON_UP)next_mode();
+             if(e.pressed&APX_BUTTON_RIGHT)battery();
++            if(e.pressed&(APX_BUTTON_SHUTTER|APX_BUTTON_DOWN)) {
++                if(mode!=MODE_DEBUG){printf("photo/recording need the SD card: press UP until the debug-link mode\n");result_beep(0);}
++                else if(e.pressed&APX_BUTTON_SHUTTER)photo();
++                else recording();
++            }
+         }
+         struct apx_buttons_info b;apx_buttons_get_info(&b);
+         if(!(b.state&APX_BUTTON_POWER))power_armed=1;
+         if(b.state!=shown){shown=b.state;held_since=apx_ticks();acted=0;}
+         uint32_t held=apx_ticks()-held_since;
+-        if(!acted&&shown==APX_BUTTON_LEFT&&held>65536u){acted=1;printf("LEFT held: boot ROM loader\n");apx_bootrom();}
+-        if(!acted&&shown==APX_BUTTON_POWER&&power_armed&&held>65536u){acted=1;printf("POWER held: off\n");
++        if(!acted&&shown==APX_BUTTON_LEFT&&held>65536u){acted=1;leave_mode();printf("LEFT held: boot ROM loader\n");apx_bootrom();}
++        if(!acted&&shown==APX_BUTTON_POWER&&power_armed&&held>65536u){acted=1;leave_mode();printf("POWER held: off\n");
+             uint32_t r=apx_power_off();printf("power off failed %#lx\n",(unsigned long)r);}
++        if(mode!=MODE_DEBUG&&apx_ticks()-blink>(mode==MODE_DRIVE?8192u:32768u)){blink=apx_ticks();led=!led;apx_led_set(led);}
+     }
+ }
+diff --git a/examples/mo2947-camera/webcam.inc b/examples/mo2947-camera/webcam.inc
+new file mode 100644
+index 0000000..3fb7960
+--- /dev/null
++++ b/examples/mo2947-camera/webcam.inc
+@@ -0,0 +1,332 @@
++/* Webcam pipeline (capture -> JPEG -> UVC) and USB microphone (UAC), taken from examples/uvc-camera/main.c
++ * (statistics output removed). Its buffers live in section .uvc_ws, which linker/mo2947.ld places over the camera
++ * app's .jpeg_buffer: only one of the two runs at a time (the preview is suspended in webcam mode). */
++#include <appotech/usb_uvc.h>
++#include <appotech/usb_uac.h>
++#include <appotech/jpeg.h>
++#include <appotech/camera.h>
++
++#define JPEG_CAPACITY (128u * 1024u)
++#define JPEG_LEAD 32u /* the JPEG starts this far into its buffer: sending writes the UVC payload header in the bytes before it */
++#define FRAME_CAPACITY (APX_CAMERA_FRAME_BYTES + 64u)
++#define TICKS_PER_SECOND 32768u
++
++/* One frame buffer in the low application window, one next to the JPEG buffers in codec RAM (neither fits twice in either). */
++static uint8_t frame_low[FRAME_CAPACITY] __attribute__((section(".uvc_ws"), aligned(32)));
++static uint8_t frame_codec[FRAME_CAPACITY] __attribute__((section(".uvc_ws"), aligned(32)));
++static uint8_t jpeg_buffer[2][JPEG_CAPACITY] __attribute__((section(".uvc_ws"), aligned(32)));
++
++enum { NV_FREE, NV_CAPTURING, NV_FULL, NV_ENCODING };
++enum { J_FREE, J_ENCODING, J_READY, J_SENDING };
++static struct { uint8_t *buf; unsigned state, stream, index, w, h; } nv[2] = { { .buf = frame_low }, { .buf = frame_codec } };
++static struct { uint8_t *buf; unsigned state, stream; uint32_t bytes, seq, sent_at; } js[2] = { { .buf = jpeg_buffer[0] + JPEG_LEAD }, { .buf = jpeg_buffer[1] + JPEG_LEAD } };
++static unsigned cap_i, enc_i;
++static uint32_t seq_next;
++
++static struct {
++    uint32_t captured[2], encoded[2], queued[2], capture_errors, encode_errors, dropped, switches, paced_out, send_ticks, send_bytes, send_frames;
++    uint32_t last_bytes[2], capture_ticks, encode_ticks, select_ticks, started, start_call_ticks, poll_done_ticks, encode_call_ticks;
++} stat;
++
++/* Streams the host has stopped reading: bulk streaming has no stop signal, so a stream is taken to be abandoned when frames were offered to it AFTER the last frame that went out
++ * completely, and none has gone out for a second (twice the frame interval when that is longer). Serving it would be wasted work (and power) and, with both sensors in use, keeps
++ * switching the sensor. The count of offers is taken at the moment of each success, so that:
++ *   - a stream whose last frame went out and that is merely waiting for its turn on the sensor has no offer outstanding and is never idle (an earlier version counted "a frame was
++ *     offered" even when that frame had already gone out, and a live stream was declared abandoned during the other camera's turn and, being idle, never served again);
++ *   - the stale frame a restarted stream still holds from its previous session (it was offered before the new session began) does not count against the new session (a version
++ *     that timed "a frame is stuck" did that, and declared a restarted stream idle before it had been given a chance).
++ * Progress (a frame completely sent) or a new session ends the idle state. */
++static unsigned host_idle[2];
++static uint32_t offered_since[2], seen_sent[2], seen_session[2], offers_at_progress[2];
++static void watch_host(void) {
++    for (unsigned s = 0; s < APX_UVC_STREAMS; ++s) {
++        const uint32_t sent = apx_usb_uvc_frames_sent(s), session = apx_usb_uvc_session(s);
++        if (sent != seen_sent[s] || session != seen_session[s]) {
++            seen_sent[s] = sent;
++            seen_session[s] = session;
++            offers_at_progress[s] = stat.queued[s];
++            offered_since[s] = 0;
++            host_idle[s] = 0;
++        }
++        if (stat.queued[s] == offers_at_progress[s]) offered_since[s] = 0; /* nothing offered since the last success */
++        else if (!offered_since[s]) offered_since[s] = apx_ticks() | 1u;
++        uint32_t limit = (uint32_t)((uint64_t)apx_usb_uvc_frame_interval_us(s) * 2u * TICKS_PER_SECOND / 1000000u);
++        if (limit < TICKS_PER_SECOND) limit = TICKS_PER_SECOND;
++        if (offered_since[s] && apx_ticks() - offered_since[s] > limit) host_idle[s] = 1;
++    }
++}
++
++static unsigned wanted(unsigned s) { return apx_usb_uvc_streaming(s) && !host_idle[s]; }
++
++/* Which stream the sensor serves next: the only one that is wanted, or in turn (one second each) when both are. */
++static int choose_stream(void) {
++    static unsigned active;
++    static uint32_t since;
++    const unsigned w0 = wanted(0), w1 = wanted(1);
++    if (w0 && w1) {
++        if (apx_ticks() - since > TICKS_PER_SECOND) { active ^= 1u; since = apx_ticks(); }
++        return (int)active;
++    }
++    if (!w0 && !w1) return -1;
++    if (active != (w0 ? 0u : 1u)) { active = w0 ? 0u : 1u; since = apx_ticks(); }
++    return (int)active;
++}
++
++static void tick_capture(void) {
++    static unsigned selected = 0xffu;
++    static uint32_t started;
++    struct apx_camera_info info;
++    if (nv[cap_i].state == NV_CAPTURING) {
++        const uint32_t tp = apx_ticks();
++        apx_camera_poll();
++        apx_camera_get_info(&info);
++        if (info.state == APX_CAMERA_DONE) stat.poll_done_ticks = apx_ticks() - tp;
++        if (info.state == APX_CAMERA_ERROR) { ++stat.capture_errors; nv[cap_i].state = NV_FREE; return; }
++        if (info.state != APX_CAMERA_DONE) return;
++        stat.capture_ticks = apx_ticks() - started;
++        /* Frame pacing: the sensor runs as fast as the exposure allows (up to 30 frames per second); the host asked for one frame per committed interval. Frames are accepted
++         * at that rate: the due time advances by one interval for every frame taken, a frame is taken once it is due (never before, so the rate never exceeds the request, and
++         * the sensor's frame period only shifts a frame later), and the others are dropped before the encoder sees them. */
++        {
++            static uint32_t due[2];
++            const uint32_t now = apx_ticks();
++            const unsigned s = nv[cap_i].stream;
++            const uint32_t interval = (uint32_t)((uint64_t)apx_usb_uvc_frame_interval_us(s) * TICKS_PER_SECOND / 1000000u);
++            if (!due[s] || (int32_t)(now - due[s]) > (int32_t)interval) due[s] = now; /* stream (re)started or fell behind by more than a frame: no catching up in a burst (a restart a little after the last frame would otherwise run at the sensor's rate until the lag is used up) */
++            if ((int32_t)(now + TICKS_PER_SECOND / 1000u - due[s]) < 0) { ++stat.paced_out; nv[cap_i].state = NV_FREE; goto arm; } /* not due yet (1 ms of slack): drop, same buffer again */
++            due[s] += interval;
++        }
++        ++stat.captured[nv[cap_i].stream];
++        nv[cap_i].state = NV_FULL;
++        cap_i ^= 1u;
++        /* No return: arm the next frame at once. The sensor starts its next frame within about a millisecond of the end of this one, and a capture armed after
++         * that start waits for the frame after it (two frame periods per frame, 80 ms, instead of one). */
++    }
++arm:
++    if (nv[cap_i].state != NV_FREE) return; /* the encoder still holds this buffer */
++    const int s = choose_stream();
++    if (s < 0) return;
++    if (selected != (unsigned)s) {
++        const uint32_t t = apx_ticks();
++        if (apx_camera_select(s == 0 ? APX_CAMERA_REAR : APX_CAMERA_FRONT)) { ++stat.capture_errors; return; }
++        stat.select_ticks = apx_ticks() - t;
++        selected = (unsigned)s;
++        ++stat.switches;
++    }
++    nv[cap_i].stream = (unsigned)s;
++    nv[cap_i].index = apx_usb_uvc_frame_index((unsigned)s);
++    nv[cap_i].w = nv[cap_i].index == APX_UVC_FRAME_320x240 ? 320 : 640;
++    nv[cap_i].h = nv[cap_i].index == APX_UVC_FRAME_320x240 ? 240 : 480;
++    started = apx_ticks();
++    /* The scaled path keeps the sensor running between frames (about 25 fps possible); a native capture_start restarts it each time and takes 233 ms. */
++    if (apx_camera_scaled_start(nv[cap_i].buf, FRAME_CAPACITY, nv[cap_i].w, nv[cap_i].h, nv[cap_i].w)) { ++stat.capture_errors; return; }
++    stat.start_call_ticks = apx_ticks() - started;
++    nv[cap_i].state = NV_CAPTURING;
++}
++
++/* JPEG quality follows the frame budget. Frames go out straight from their buffer at about 10 MB/s (measured with examples/uvc-bench: 100 KB frames at 116 per second; the
++ * payload copy TinyUSB would make capped it at 4.5 MB/s), so at 30 frames per second a frame may be 300 KB: more than the JPEG buffer holds, and the stock quality 90 (85 KB
++ * for a busy 640x480 scene) fits at any rate. The budget is kept for slower links or a busier loop: a stream's quality is lowered when a frame is over its budget (the
++ * interval the host committed times SEND_BYTES_PER_S, with 15% margin) and raised slowly while frames are well under it. */
++#ifndef APX_UVC_SEND_BYTES_PER_S
++#define APX_UVC_SEND_BYTES_PER_S 6000000u
++#endif
++#define JPEG_QUALITY_MIN 15u
++#define JPEG_QUALITY_MAX 90u
++static unsigned jpeg_quality[2] = { 75, 75 };
++static void adapt_quality(unsigned s, uint32_t bytes) {
++    uint32_t budget = (uint32_t)((uint64_t)APX_UVC_SEND_BYTES_PER_S * apx_usb_uvc_frame_interval_us(s) / 1000000u * 85u / 100u);
++    if (budget > JPEG_CAPACITY - 4096u) budget = JPEG_CAPACITY - 4096u;
++    unsigned q = jpeg_quality[s];
++    if (bytes > budget) { const unsigned drop = bytes > budget + budget / 2 ? 8u : 3u; q = q > JPEG_QUALITY_MIN + drop ? q - drop : JPEG_QUALITY_MIN; }
++    else if (bytes < budget * 70u / 100u && q < JPEG_QUALITY_MAX) ++q;
++    jpeg_quality[s] = q;
++}
++
++static void tick_encode(void) {
++    static uint32_t started;
++    static int slot = -1;
++    struct apx_jpeg_info info;
++    if (nv[enc_i].state == NV_ENCODING) {
++        apx_jpeg_poll();
++        apx_jpeg_get_info(&info);
++        if (info.state == APX_JPEG_ERROR) { ++stat.encode_errors; js[slot].state = J_FREE; nv[enc_i].state = NV_FREE; enc_i ^= 1u; return; }
++        if (info.state != APX_JPEG_DONE) return;
++        ++stat.encoded[nv[enc_i].stream];
++        stat.last_bytes[nv[enc_i].stream] = info.bytes;
++        adapt_quality(nv[enc_i].stream, info.bytes);
++        stat.encode_ticks = apx_ticks() - started;
++        js[slot].bytes = info.bytes;
++        js[slot].state = J_READY;
++        nv[enc_i].state = NV_FREE;
++        enc_i ^= 1u;
++        return;
++    }
++    if (nv[enc_i].state != NV_FULL) return;
++    if (!wanted(nv[enc_i].stream)) { ++stat.dropped; nv[enc_i].state = NV_FREE; enc_i ^= 1u; return; } /* the client left meanwhile */
++    slot = js[0].state == J_FREE ? 0 : js[1].state == J_FREE ? 1 : -1;
++    if (slot < 0) return; /* both JPEG buffers are waiting to go out */
++    const unsigned w = nv[enc_i].w, h = nv[enc_i].h;
++    started = apx_ticks();
++    apx_jpeg_set_encode_quality(jpeg_quality[nv[enc_i].stream]);
++    const int enc_e = apx_jpeg_encode_start(nv[enc_i].buf, nv[enc_i].buf + w * h, w, h, w, w, h, 8, js[slot].buf, JPEG_CAPACITY - JPEG_LEAD);
++    stat.encode_call_ticks = apx_ticks() - started;
++    if (enc_e) {
++        ++stat.encode_errors;
++        nv[enc_i].state = NV_FREE;
++        enc_i ^= 1u;
++        return;
++    }
++    js[slot].state = J_ENCODING;
++    js[slot].stream = nv[enc_i].stream;
++    js[slot].seq = seq_next++;
++    nv[enc_i].state = NV_ENCODING;
++}
++
++static void tick_send(void) {
++    for (unsigned i = 0; i < 2; ++i)
++        if (js[i].state == J_SENDING && !apx_usb_uvc_busy(js[i].stream)) { /* TinyUSB is done with the buffer */
++            stat.send_ticks += apx_ticks() - js[i].sent_at; stat.send_bytes += js[i].bytes; ++stat.send_frames;
++            js[i].state = J_FREE;
++        }
++    /* A finished frame of a stream nobody reads would keep a JPEG buffer (and so, in the end, the whole pipeline) waiting for ever: drop it. A frame already
++     * queued on such a stream stays with TinyUSB until the client returns, and its buffer stays reserved; the other buffer keeps the other stream going. */
++    for (unsigned i = 0; i < 2; ++i)
++        if (js[i].state == J_READY && !wanted(js[i].stream)) { ++stat.dropped; js[i].state = J_FREE; }
++    /* the oldest finished frame whose stream can take it (frames of one stream must go out in order) */
++    int best = -1;
++    for (unsigned i = 0; i < 2; ++i)
++        if (js[i].state == J_READY && (best < 0 || (int32_t)(js[i].seq - js[best].seq) < 0)) best = (int)i;
++    if (best < 0) return;
++    if (!apx_usb_uvc_streaming(js[best].stream)) { ++stat.dropped; js[best].state = J_FREE; return; }
++    if (apx_usb_uvc_busy(js[best].stream)) return;
++    /* The two video endpoints share their packet RAM buffers: never start a frame on one while the other is still sending (a stream nobody reads is ignored, its stale packet is flushed). */
++    if (apx_usb_uvc_busy(js[best].stream ^ 1u) && !host_idle[js[best].stream ^ 1u]) return;
++    if (apx_usb_uvc_send_frame(js[best].stream, js[best].buf, js[best].bytes) == 0) {
++        ++stat.queued[js[best].stream];
++        js[best].sent_at = apx_ticks();
++        js[best].state = J_SENDING;
++    }
++}
++
++#if 1
++#ifndef APX_UVC_TONE
++#define APX_UVC_TONE 0 /* 1 = the microphone endpoint carries a 1 kHz test tone instead of the microphone (for the host tests) */
++#endif
++#if APX_UVC_TONE
++static const int16_t tone[32] = { 0, 1561, 3061, 4445, 5657, 6652, 7391, 7846, 8000, 7846, 7391, 6652, 5657, 4445, 3061, 1561, 0, -1561, -3061, -4445, -5657, -6652, -7391, -7846, -8000, -7846, -7391, -6652, -5657, -4445, -3061, -1561 };
++/* A 1 kHz sine, produced at the sample rate from the 32768 Hz tick (the two clocks drift against the USB frame clock; the driver's ring absorbs it). */
++static void tick_audio(void) {
++    static uint32_t last, owed, phase;
++    const uint32_t now = apx_ticks();
++    if (!apx_usb_uac_streaming()) { last = now; owed = 0; return; }
++    owed += (now - last) * APX_UAC_RATE;
++    last = now;
++    unsigned n = owed / TICKS_PER_SECOND;
++    owed -= n * TICKS_PER_SECOND;
++    if (n > 256) n = 256;
++    int16_t block[256];
++    for (unsigned i = 0; i < n; ++i) block[i] = tone[phase++ & 31u];
++    if (n) apx_usb_uac_write_raw(block, n);
++}
++#else
++/* The microphone: the SoC's recording DMA fills one buffer and stops (it does not wrap and does not report its position), but it writes the samples as they are
++ * taken, 32 per millisecond. So the buffer is filled with a sentinel (-32768) first and the samples that have replaced it are forwarded to the USB ring as they appear.
++ * Two buffers alternate. While one is being recorded the other is made ready (sentinel written and pushed out of the cache, a little per call), so that when the recording ends
++ * the next one starts with a few register writes: the sample FIFO of the core only bridges a very short gap, and doing the preparation at that moment (3.3 ms) lost about 100
++ * samples every second. The service routine is also called by the USB poll, so the handover is not left waiting for the main loop. */
++#define MIC_CHUNK 32768u /* the largest buffer the DMA takes (64 KiB): a restart, and its 16 ms smoothed spot, once per 1.024 s */
++#define MIC_PREP_STEP 2048u
++static int16_t mic_buf[2][MIC_CHUNK] __attribute__((section(".uvc_ws"), aligned(32)));
++static unsigned mic_which, mic_pos, mic_running, mic_started, mic_prep; /* mic_prep: samples of the idle buffer that are ready (MIC_CHUNK = all) */
++static uint32_t mic_restarts, mic_start_errors;
++static int mic_start(void) {
++    int16_t *b = mic_buf[mic_which];
++    for (unsigned i = 0; i < MIC_CHUNK; ++i) b[i] = -32768;
++    mic_pos = 0;
++    mic_prep = 0;
++    return mic_started ? apx_mic_rearm(b, sizeof mic_buf[0]) : apx_mic_capture_start_continuous(b, sizeof mic_buf[0], APX_UAC_RATE);
++}
++static void mic_prepare(void) { /* one step of getting the idle buffer ready */
++    if (mic_prep >= MIC_CHUNK) return;
++    int16_t *b = mic_buf[mic_which ^ 1u] + mic_prep;
++    for (unsigned i = 0; i < MIC_PREP_STEP; ++i) b[i] = -32768;
++    apx_dma_clean(b, MIC_PREP_STEP * 2);
++    apx_dma_invalidate(b, MIC_PREP_STEP * 2);
++    mic_prep += MIC_PREP_STEP;
++}
++/* Every capture (re)start puts a decaying DC step at the start of the signal (about -1100 counts relaxing over ~500 samples, 15 ms: the microphone path's DC remover starts from
++ * zero; it also happens with the analog stage left running). The first MIC_SKIP samples of a buffer are therefore not forwarded; the gap is bridged with a straight line from the
++ * last sample sent to the first good one, which keeps the sample count (and so the timing) and leaves a 16 ms smoothed spot once per buffer. */
++#define MIC_SKIP 512u
++static int16_t mic_last;
++static uint32_t mic_prev_start, mic_lat_sum, mic_lat_max, mic_dma_sum;
++static uint32_t mic_total, mic_t0; /* samples forwarded since the stream started, and the tick it started at */
++static void mic_forward(int finished) {
++    int16_t *b = mic_buf[mic_which];
++    int16_t out[256 + MIC_SKIP];
++    unsigned n = 0;
++    while (mic_pos < MIC_CHUNK) {
++        const unsigned from = mic_pos & ~7u, limit = mic_pos + 256 < MIC_CHUNK ? mic_pos + 256 : MIC_CHUNK;
++        apx_dma_invalidate(b + from, ((limit + 7u) / 8u * 8u - from) * 2u); /* whole 16-byte cache lines (8 samples) or the call refuses and the old sentinel stays in the cache */
++        unsigned i = mic_pos;
++        n = 0;
++        while (i < limit && (finished || b[i] != -32768)) {
++            const int16_t sample = b[i]; /* the level stage (DC blocker, mute, volume, AGC) is in the USB audio driver, controlled from the host's mixer */
++            if (i == MIC_SKIP) { /* the first good sample: bridge the skipped ones */
++                for (unsigned k = 0; k < MIC_SKIP; ++k) out[n++] = (int16_t)(mic_last + ((int)sample - mic_last) * (int)(k + 1) / (int)(MIC_SKIP + 1));
++            }
++            if (i >= MIC_SKIP) { out[n++] = sample; mic_last = sample; }
++            ++i;
++        }
++        if (n) { apx_usb_uac_write(out, n); mic_total += n; n = 0; }
++        mic_pos = i;
++        if (i < limit) break; /* the DMA has not got further yet */
++    }
++}
++static void tick_audio(void) {
++    static unsigned busy; /* the routine is called from the USB poll, which the mic calls below can reach through a delay */
++    if (busy) return;
++    busy = 1;
++    if (!apx_usb_uac_streaming()) {
++        if (mic_running) {
++            const uint32_t dt = apx_ticks() - mic_t0;
++            apx_mic_stop(); mic_running = 0;
++            (void)dt;
++        }
++        busy = 0;
++        return;
++    }
++    struct apx_mic_info mi;
++    if (!mic_running) {
++        mic_started = 0;
++        if (mic_start() == 0) { mic_running = 1; mic_started = 1; mic_total = 0; mic_t0 = apx_ticks(); mic_prev_start = 0; mic_lat_sum = mic_lat_max = mic_dma_sum = 0; } else ++mic_start_errors;
++        busy = 0;
++        return;
++    }
++    apx_mic_get_info(&mi);
++    if (mi.state == APX_MIC_CAPTURING) {
++        mic_forward(0);
++        mic_prepare();
++    } else if (mi.state == APX_MIC_DONE && mic_prep >= MIC_CHUNK) {
++        /* the buffer is full and the next one is ready: start it at once, then take what is left of this one */
++        const unsigned next = mic_which ^ 1u;
++        if (apx_mic_rearm_prepared(mic_buf[next], sizeof mic_buf[0]) == 0) {
++            const uint32_t t = apx_ticks();
++            if (mic_prev_start) { const uint32_t lat = t - mic_prev_start - mi.ticks; mic_lat_sum += lat; if (lat > mic_lat_max) mic_lat_max = lat; mic_dma_sum += mi.ticks; }
++            mic_prev_start = t;
++            mic_forward(1);
++            mic_which = next; mic_pos = 0; mic_prep = 0;
++            ++mic_restarts;
++        } else { mic_running = 0; ++mic_start_errors; }
++    } else {
++        /* the capture failed, or the next buffer was not ready in time: the slow way */
++        if (mi.state == APX_MIC_DONE) mic_forward(1);
++        mic_which ^= 1u;
++        if (mic_start() == 0) { ++mic_restarts; mic_prev_start = apx_ticks(); } else { mic_running = 0; ++mic_start_errors; }
++    }
++    busy = 0;
++}
++#endif
++#endif
++
+diff --git a/linker/mo2947.ld b/linker/mo2947.ld
+index 80fc8ab..532bfd1 100644
+--- a/linker/mo2947.ld
++++ b/linker/mo2947.ld
+@@ -25,10 +25,17 @@ SECTIONS {
+  .display_dma (NOLOAD) : ALIGN(32) { __display_dma_start = .; *(.display_dma) __display_dma_end = .; } > RAM
+  .large_buffer (NOLOAD) : ALIGN(32) { __large_buffer_start = .; *(.large_buffer) __large_buffer_end = .; } > RAM
+  .jpeg_buffer (NOLOAD) : ALIGN(32) { __jpeg_buffer_start = .; *(.jpeg_buffer) __jpeg_buffer_end = .; } > RAM
+- __ram_used_end = .;
++ /* Webcam buffers (examples/mo2947-camera/webcam.inc) share memory with .jpeg_buffer: the camera app's preview and photo
++  * buffers and the webcam pipeline never run at the same time. The overlap needs --no-check-sections (Makefile, this board
++  * only); the asserts below replace the checks that switches off. */
++ .uvc_ws __jpeg_buffer_start (NOLOAD) : { __uvc_ws_start = .; *(.uvc_ws) __uvc_ws_end = .; }
++ __ram_used_end = MAX(__jpeg_buffer_end, __uvc_ws_end);
+  .stack (NOLOAD) : { __stack_bottom = .; . += LENGTH(STACK); __stack_top = .; } > STACK
+  /DISCARD/ : { *(.eh_frame*) *(.comment) *(.note*) }
+ }
+ ASSERT(mo2947_bootstrap_call == 0x020004a8, "bootstrap call target must be at 0x020004a8")
+ ASSERT(SIZEOF(.entry) <= 0x4a8, "start-up code overlaps the bootstrap call target")
+ ASSERT(__image_end <= 0x0207a400, "image larger than the 0x7A400 bytes the stock header loads")
++ASSERT(__ram_used_end <= ORIGIN(STACK), "RAM buffers run into the stack")
++ASSERT(__bss_start >= __image_end && __display_dma_start >= __heap_end && __large_buffer_start >= __display_dma_end &&
++       __jpeg_buffer_start >= __large_buffer_end, "NOLOAD sections out of order")
+-- 
+2.56.1
+
+
+From 94040283abe0b5071e080e14b0ff27f985f9d37f Mon Sep 17 00:00:00 2001
+From: Samuel Steinhart <ssteinhart@student.tgm.ac.at>
+Date: Fri, 13 Nov 2026 15:19:06 +0100
+Subject: [PATCH 3/4] mo2947: build on macOS (Homebrew paths in build.py,
+ shasum fallback), dump path relative to the ToyCamera repo
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Makefile           |  7 +++++--
+ toolchain/build.py | 28 ++++++++++++++++++++++++----
+ 2 files changed, 29 insertions(+), 6 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 245661f..ae2e600 100644
+--- a/Makefile
++++ b/Makefile
+@@ -5,7 +5,10 @@ AR := $(CROSS)ar
+ OBJDUMP := $(CROSS)objdump
+ SIZE := $(CROSS)size
+ BOARD ?= action-vision
+-MO2947_DUMP ?= $(HOME)/Projects/ToyCamera/dumps/mo2947_flash_a.bin
++# Your own camera's flash backup (tools/mo2947_dump.py), two levels up in the ToyCamera repo
++MO2947_DUMP ?= $(abspath $(CURDIR)/../../dumps/mo2947_flash_a.bin)
++# macOS has no sha256sum before 15; shasum -a 256 prints the same format
++SHA256SUM := $(shell command -v sha256sum >/dev/null 2>&1 && echo sha256sum || echo 'shasum -a 256')
+ BOARDS := action-vision silvergear-3222882 mo2947
+ ifeq ($(filter $(BOARD),$(BOARDS)),)
+ $(error BOARD must be one of: $(BOARDS))
+@@ -117,7 +120,7 @@ MAIN := examples/$(EXAMPLE)/main.c
+ MAIN_INPUTS := $(MAIN)
+ LIBC := $(PREFIX)/or1k-appotech-elf/lib/libc.a
+ LIBGCC := $(shell $(CC) -print-libgcc-file-name)
+-BUILD_ID := $(shell { cat src/*.c src/*.S src/*.inc src/*.h $(wildcard src/tusb/*) third_party/fatfs/ff.c third_party/fatfs/ffunicode.c third_party/fatfs/ff.h third_party/fatfs/ffconf.h third_party/fatfs/diskio.h include/appotech/*.h $(BOARD_INPUTS) linker/ram.ld $(MAIN_INPUTS) third_party/stb/stb_image.h tools/prepare_stb.py $(LVGL_BUILD_INPUTS) $(LIBC) $(LIBGCC) $(wildcard toolchain/sources.lock.json); printf '%s\n' '$(BOARD)' '$(USB_STACK)' '$(APX_USB_MSC)' '$(APX_USB_UVC)' '$(APX_USB_UAC)' '$(EXAMPLE_DEFS)' '$(OPT)' '$(LTO)' '$(HEAP_SIZE)' '$(USB_VID)' '$(USB_PID)' '$(FORCE_FULL_SPEED)' '$(CPU_MHZ)' '$(HW_MULDIV)' '$(APX_SPI_TRACE)' '$(APX_TRACE_KEEP_WDT)' '$(APX_LAUNCH_SETTLE_TICKS)' '$(APX_LAUNCH_READS)' '$(APX_NO_CACHE_ENABLE)' '$(APX_LAUNCH_WDT_STOP)' '$(APX_LAUNCH_READ_LIST)' '$(APX_LAUNCH_TRACE_MODE)' '$(APX_USB_ENUM_TIMEOUT_TICKS)' '$(APX_SPI_TRACE_RING_ONLY)' '$(LVGL_INSTRUMENT)' '$(EXAMPLE)' '$(if $(LVGL_ENABLED),$(LVGL_DEMO) perf$(LVGL_PERF))'; } | sha256sum | cut -c1-16)
++BUILD_ID := $(shell { cat src/*.c src/*.S src/*.inc src/*.h $(wildcard src/tusb/*) third_party/fatfs/ff.c third_party/fatfs/ffunicode.c third_party/fatfs/ff.h third_party/fatfs/ffconf.h third_party/fatfs/diskio.h include/appotech/*.h $(BOARD_INPUTS) linker/ram.ld $(MAIN_INPUTS) third_party/stb/stb_image.h tools/prepare_stb.py $(LVGL_BUILD_INPUTS) $(LIBC) $(LIBGCC) $(wildcard toolchain/sources.lock.json); printf '%s\n' '$(BOARD)' '$(USB_STACK)' '$(APX_USB_MSC)' '$(APX_USB_UVC)' '$(APX_USB_UAC)' '$(EXAMPLE_DEFS)' '$(OPT)' '$(LTO)' '$(HEAP_SIZE)' '$(USB_VID)' '$(USB_PID)' '$(FORCE_FULL_SPEED)' '$(CPU_MHZ)' '$(HW_MULDIV)' '$(APX_SPI_TRACE)' '$(APX_TRACE_KEEP_WDT)' '$(APX_LAUNCH_SETTLE_TICKS)' '$(APX_LAUNCH_READS)' '$(APX_NO_CACHE_ENABLE)' '$(APX_LAUNCH_WDT_STOP)' '$(APX_LAUNCH_READ_LIST)' '$(APX_LAUNCH_TRACE_MODE)' '$(APX_USB_ENUM_TIMEOUT_TICKS)' '$(APX_SPI_TRACE_RING_ONLY)' '$(LVGL_INSTRUMENT)' '$(EXAMPLE)' '$(if $(LVGL_ENABLED),$(LVGL_DEMO) perf$(LVGL_PERF))'; } | $(SHA256SUM) | cut -c1-16)
+ CFLAGS := $(OPT) -g -mappotech -fno-delayed-branch -fno-pic -ffunction-sections -fdata-sections -fno-common -Wall -Wextra -Werror -Iinclude -Iboards/$(BOARD) -Ithird_party/fatfs -DAPX_BUILD_ID='"$(BUILD_ID)"' -DAPX_USB_VID=$(USB_VID) -DAPX_USB_PID=$(USB_PID) -DAPX_USB_FORCE_FULL_SPEED=$(FORCE_FULL_SPEED) -DAPX_CPU_MHZ=$(CPU_MHZ) -DAPX_SPI_TRACE=$(APX_SPI_TRACE) -DAPX_TRACE_KEEP_WDT=$(APX_TRACE_KEEP_WDT) -DAPX_LAUNCH_SETTLE_TICKS=$(APX_LAUNCH_SETTLE_TICKS) -DAPX_LAUNCH_TRACE_MODE=$(APX_LAUNCH_TRACE_MODE) -DAPX_NO_CACHE_ENABLE=$(APX_NO_CACHE_ENABLE) -DAPX_USB_ENUM_TIMEOUT_TICKS=$(APX_USB_ENUM_TIMEOUT_TICKS) -DAPX_SPI_TRACE_RING_ONLY=$(APX_SPI_TRACE_RING_ONLY) -DAPX_LVGL_INSTRUMENT=$(LVGL_INSTRUMENT) -DAPX_LAUNCH_READS=$(APX_LAUNCH_READS) -DAPX_LAUNCH_WDT_STOP=$(APX_LAUNCH_WDT_STOP) '-DAPX_LAUNCH_READ_LIST=$(APX_LAUNCH_READ_LIST)'
+ ifneq ($(LVGL_ENABLED),)
+ CFLAGS += -Ithird_party/lvgl -Ithird_party/lvgl/include -DLV_CONF_INCLUDE_SIMPLE -DAPX_LVGL_DEMO='"$(LVGL_DEMO)"' -DAPX_LVGL_PERF=$(LVGL_PERF)
+diff --git a/toolchain/build.py b/toolchain/build.py
+index 71da994..8572b18 100644
+--- a/toolchain/build.py
++++ b/toolchain/build.py
+@@ -6,6 +6,7 @@ import json
+ import os
+ from pathlib import Path
+ import subprocess
++import sys
+ 
+ SDK = Path(__file__).resolve().parents[1]
+ WORKSPACE = SDK.parent
+@@ -32,14 +33,33 @@ def run(args, cwd, env):
+     print('Running:', ' '.join(map(str,args)), flush=True)
+     subprocess.run(list(map(str,args)), cwd=cwd, env=env, check=True)
+ 
++def brew_prefix(formula):
++    """Homebrew keg path on macOS, or None (Linux, or formula missing)."""
++    if sys.platform!='darwin':return None
++    try:return subprocess.check_output(['brew','--prefix',formula],text=True,stderr=subprocess.DEVNULL).strip() or None
++    except (OSError,subprocess.CalledProcessError):return None
++
++def host_setup(env):
++    """macOS: Homebrew's GNU bison/flex/texinfo/make come first on PATH (the system ones are too old), and GCC is told
++    where GMP/MPFR/MPC live (not on the default search path). Returns (make command, extra gcc configure flags)."""
++    if sys.platform!='darwin':return 'make',[]
++    paths=[f'{p}/bin' for p in map(brew_prefix,('bison','flex','texinfo','m4')) if p]
++    gmake=brew_prefix('make')
++    if gmake:paths.append(f'{gmake}/libexec/gnubin')
++    env['PATH']=os.pathsep.join(paths+[env['PATH']])
++    extra=[f'--with-{name}={p}' for name,formula in (('gmp','gmp'),('mpfr','mpfr'),('mpc','libmpc'))
++           if (p:=brew_prefix(formula))]
++    return 'make',extra
++
+ def main():
+     p=argparse.ArgumentParser()
+     p.add_argument('stage', choices=['binutils','gcc','libgcc','picolibc'])
+-    p.add_argument('--jobs',type=int,default=3)
++    p.add_argument('--jobs',type=int,default=os.cpu_count() or 3)
+     args=p.parse_args()
+     env=os.environ.copy()
+     env['PATH']=str(PREFIX/'bin')+os.pathsep+env['PATH']
+     env['CFLAGS_FOR_TARGET']=FLAGS
++    make,host_flags=host_setup(env)
+     BUILD.mkdir(parents=True,exist_ok=True)
+     (PREFIX/TARGET/'usr/include').mkdir(parents=True,exist_ok=True)
+     source=(COMPILERS/('binutils-gdb' if args.stage=='binutils' else 'gcc')).resolve()
+@@ -59,13 +79,13 @@ def main():
+                 common+=['--enable-languages=c,c++','--without-headers','--disable-bootstrap',
+                          '--disable-shared','--disable-threads','--disable-libssp',
+                          '--disable-libquadmath','--disable-libgomp','--disable-libatomic',
+-                         '--disable-libsanitizer','--with-picolibc',f'--with-sysroot={PREFIX/TARGET}']
++                         '--disable-libsanitizer','--with-picolibc',f'--with-sysroot={PREFIX/TARGET}']+host_flags
+             run(common,out,env)
+         targets=['all','install'] if args.stage=='binutils' else ['all-gcc','install-gcc']
+-        for target in targets:run(['make',f'-j{args.jobs}',target],out,env)
++        for target in targets:run([make,f'-j{args.jobs}',target],out,env)
+     elif args.stage=='libgcc':
+         for target in ['all-target-libgcc','install-target-libgcc']:
+-            run(['make',f'-j{args.jobs}',f'CFLAGS_FOR_TARGET={FLAGS} --sysroot={PREFIX/TARGET}',target],BUILD/'gcc',env)
++            run([make,f'-j{args.jobs}',f'CFLAGS_FOR_TARGET={FLAGS} --sysroot={PREFIX/TARGET}',target],BUILD/'gcc',env)
+     else:
+         source=SDK/'third_party/picolibc'
+         if not source.exists():
+-- 
+2.56.1
+
+
+From d6425f546460d8fdfb35f3f01f4e07b61c943ecf Mon Sep 17 00:00:00 2001
+From: Samuel Steinhart <ssteinhart@student.tgm.ac.at>
+Date: Fri, 13 Nov 2026 15:25:40 +0100
+Subject: [PATCH 4/4] mo2947: generate panel.inc before display.o on a fresh
+ checkout; clear error without a dump
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Makefile | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index ae2e600..73a363f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -52,6 +52,8 @@ override APX_USB_MSC := 1
+ endif
+ BUILD ?= $(if $(filter action-vision,$(BOARD)),build,build/$(BOARD))$(if $(filter-out $(DEFAULT_USB_STACK),$(USB_STACK)),-$(USB_STACK))
+ BOARD_INPUTS := $(sort $(wildcard boards/$(BOARD)/*))
++# Generated board files (not in git) that compile steps must wait for; mo2947: the LCD table from the flash dump
++BOARD_GENERATED := $(if $(filter mo2947,$(BOARD)),boards/mo2947/panel.inc)
+ DISPLAY_SOURCE := $(if $(filter silvergear-3222882 mo2947,$(BOARD)),src/display_st7789.c,src/display.c)
+ OPT ?= -Os
+ LTO ?= 1
+@@ -201,7 +203,8 @@ $(BUILD)/mo2947_entry.o: boards/mo2947/entry.S | $(BUILD)
+ 	$(CC) $(CFLAGS) -c $< -o $@
+ $(BUILD)/mo2947_early.o: boards/mo2947/early.c | $(BUILD)
+ 	$(CC) $(filter-out -flto -fuse-linker-plugin,$(CFLAGS)) -c $< -o $@
+-boards/mo2947/panel.inc: boards/mo2947/gen_panel.py $(MO2947_DUMP)
++boards/mo2947/panel.inc: boards/mo2947/gen_panel.py $(wildcard $(MO2947_DUMP))
++	@test -f $(MO2947_DUMP) || { echo 'missing $(MO2947_DUMP): back up the camera first (./cam dump stock dumps/mo2947_flash_a.bin in the ToyCamera repo), or set MO2947_DUMP' >&2; exit 1; }
+ 	python3 -I $< $(MO2947_DUMP) $@
+ # Flash image: 0x02000000.. as the boot ROM loads it from flash 0x2200. The PLL check needs pyelftools.
+ $(BUILD)/$(EXAMPLE).bin: $(BUILD)/$(EXAMPLE).elf
+@@ -244,7 +247,7 @@ $(BUILD)/tusb/msc_device.o: $(TINYUSB)/class/msc/msc_device.c $(BUILD)/config.st
+ $(BUILD)/tusb/video_device.o: $(TINYUSB)/class/video/video_device.c $(BUILD)/config.stamp | $(BUILD)
+ 	mkdir -p $(dir $@)
+ 	$(CC) $(CFLAGS) -Wno-error -MMD -MP -c $< -o $@
+-$(BUILD)/display.o: $(DISPLAY_SOURCE) $(BOARD_INPUTS) $(BUILD)/config.stamp | $(BUILD)
++$(BUILD)/display.o: $(DISPLAY_SOURCE) $(BOARD_INPUTS) $(BOARD_GENERATED) $(BUILD)/config.stamp | $(BUILD)
+ 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+ $(BUILD)/%.o: src/%.S $(BUILD)/config.stamp | $(BUILD)
+ 	$(CC) $(CFLAGS) -c $< -o $@
+-- 
+2.56.1
+
